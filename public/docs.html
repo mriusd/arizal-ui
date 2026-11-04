@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Arizal docs</title>
+    <style>
+      :root {
+        --bg: #0e1116;
+        --panel: #171b22;
+        --line: #2a3140;
+        --text: #e8edf5;
+        --muted: #8b95a8;
+        --yes: #3dd68c;
+        --no: #f07178;
+        --accent: #6ea8fe;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 12px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+      header a { color: var(--accent); text-decoration: none; }
+      header strong { letter-spacing: 0.04em; }
+      main { max-width: 880px; margin: 0 auto; padding: 28px 20px 80px; }
+      h1 { font-size: 28px; margin: 0 0 8px; }
+      h2 { font-size: 18px; margin: 36px 0 8px; border-top: 1px solid var(--line); padding-top: 20px; }
+      h3 { font-size: 15px; margin: 22px 0 6px; }
+      p, li { color: var(--text); }
+      .lead { color: var(--muted); margin-top: 0; }
+      nav.toc a { color: var(--accent); margin-right: 14px; }
+      code, pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+      }
+      code { color: #d5def0; }
+      pre {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 12px 14px;
+        overflow: auto;
+      }
+      table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; }
+      th, td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+      th { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0.04em; }
+      td code { white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="/"><strong>ARIZAL</strong></a>
+      <span>arizal.xyz</span>
+      <span>docs</span>
+    </header>
+    <main>
+      <h1>Arizal</h1>
+      <p class="lead">The exchange at arizal.xyz. Hybrid CLOB for timed BTC hit, above, and between markets. Matching is off chain. USDC, shares, and settlement live on the exchange contract. The UI talks only to HTTP and websocket <code>/v1</code>. The on-chain EIP-712 domain name is <code>Arizal</code>.</p>
+      <nav class="toc">
+        <a href="#logic">Exchange logic</a>
+        <a href="#contract">Contract</a>
+        <a href="#api">API</a>
+      </nav>
+
+      <h2 id="logic">Exchange logic</h2>
+      <p>Three kinds: <strong>hit</strong>, <strong>above</strong>, <strong>between</strong>. Four timeframes: <strong>daily</strong>, <strong>weekly</strong>, <strong>monthly</strong>, <strong>quarterly</strong>. Each market has a UTC-midnight <code>expires_at</code>. The node opens 7 future expiries per timeframe around Binance BTCUSDT on a $1,000 grid (ids include the timeframe, e.g. <code>btc-hit-&lt;usd&gt;-up-daily-&lt;expires_at&gt;</code>). Daily = next midnights; weekly = Mondays 00:00 UTC; monthly = 1sts; quarterly = Jan/Apr/Jul/Oct 1. Hit settles Yes early when spot touches the barrier; at expiry without a touch, No. Above settles only at expiry (Yes if spot ≥ barrier). Between settles only at expiry (Yes if barrier ≤ spot ≤ barrier_high). One share pays $1 if that side wins and $0 if it loses.</p>
+
+      <h3>Book</h3>
+      <p>The book is two bid lists, Yes and No. A Yes bid at <code>p</code> crosses a No bid at <code>q</code> when <code>p + q &gt;= 100</code>. The trade prints at the maker’s price. The taker pays the complement, so the two sides together put up $1 per share. Prices are 1–99 cents. Same price is first-in, first-out. Size uses 6 decimals, the same scale as USDC (<code>1</code> share is <code>1000000</code>).</p>
+      <p>A buy can rest (GTC or GTD) or take immediately (FOK or FAK). A sell does not rest. It hits same-side bids. The seller is the taker. The resting bid is the maker and receives the shares.</p>
+      <p>Self-trades are rejected. The engine does not hold keys or USDC. It writes an append-only tape. The trade admin later submits the match to the contract.</p>
+
+      <h3>Money on a fill</h3>
+      <p>Both wallets must have deposited collateral. Yes pays <code>size × yesPrice / 100</code>. No pays the rest of the bundle, plus any price improvement. If the two limits sum to more than 100, the extra is returned to the taker. The taker also pays the trading fee. The maker pays no fee.</p>
+      <pre>fee = shares × (trading_fee_factor / 1e18) × p × (1 − p)</pre>
+      <p><code>p</code> is the execution price in dollars. The fee is the same at 30¢ and 70¢ and is largest at 50¢. The local config uses <code>70000000000000000</code>, which is a rate of 0.07. Collected fees sit in <code>feePot</code> until the operator calls <code>withdrawFees</code>. A factor of 0 charges nothing.</p>
+
+      <h3>Split, merge, close, redeem</h3>
+      <p>Split locks <code>n</code> USDC and mints <code>n</code> Yes and <code>n</code> No. Merge burns one Yes and one No and returns $1. Close sells shares into same-side bids. The trade admin calls <code>settleClose</code>, which moves the shares and the USDC. Redeem, after the market is Yes, burns the winning shares and credits $1 each. Losing shares pay nothing.</p>
+
+      <h3>Who can do what</h3>
+      <ul>
+        <li>Any wallet: deposit, withdraw, split, merge, redeem, <code>settleIfHit</code>, <code>settle</code>.</li>
+        <li>Trade admin only: <code>createHitMarket</code> / <code>createAboveMarket</code> / <code>createBetweenMarket</code>, <code>settleFill</code>, and <code>settleClose</code>. A fresh deploy sets this to the operator. <code>settleClose</code> has no user signature, so that key can move shares and collateral.</li>
+        <li>Operator only: <code>setTradeAdmin</code>, <code>setTradingFeeFactor</code>, <code>withdrawFees</code>, and the proxy upgrade.</li>
+      </ul>
+
+      <h2 id="contract">Contract</h2>
+      <p>The address in <code>clearbook.toml</code> is a UUPS proxy (<code>ArizalProxy</code>). Collateral, shares, and markets live on the proxy. <code>initialize(usdc, aggregator, operator)</code> runs once. It sets the EIP-712 domain to <code>Arizal</code> / <code>1</code> and <code>tradeAdmin</code> to the operator. New storage is appended. It is not reordered.</p>
+      <p>Upgrading deploys a new <code>Exchange</code> implementation and the operator calls <code>upgradeToAndCall</code>. The proxy address does not change. See <code>INSTRUCTIONS.md</code>.</p>
+
+      <h3>Contracts</h3>
+      <table>
+        <thead><tr><th>Contract</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>Exchange</code></td><td>Implementation. Custody, fills, fees, hit settlement.</td></tr>
+          <tr><td><code>ArizalProxy</code></td><td>ERC-1967 proxy. This is the exchange address.</td></tr>
+          <tr><td><code>MockUSDC</code></td><td>6-decimal demo USDC. <code>faucet</code> mints to the caller.</td></tr>
+          <tr><td><code>MockAggregatorV3</code></td><td>Fake Chainlink BTC/USD. The node writes the Binance spot into the latest round.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Exchange calls</h3>
+      <table>
+        <thead><tr><th>Call</th><th>Who</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>deposit</code> / <code>withdraw</code></td><td>user</td><td>Move USDC in or out of that wallet’s collateral.</td></tr>
+          <tr><td><code>split</code> / <code>merge</code></td><td>user</td><td>Mint or burn a complete Yes+No set.</td></tr>
+          <tr><td><code>redeem</code></td><td>user</td><td>After a Yes resolution, $1 per winning share.</td></tr>
+          <tr><td><code>createMarket</code></td><td>trade admin</td><td>Open a hit / above / between market; active once created; <code>startTs</code> = create time; <code>expiresAt</code> must be UTC midnight after create.</td></tr>
+          <tr><td><code>settleIfHit</code></td><td>anyone</td><td>Hit only. If spot touched the barrier, resolve Yes. Once.</td></tr>
+          <tr><td><code>settle</code></td><td>anyone</td><td>After expiry. Winner from spot per kind. Once.</td></tr>
+          <tr><td><code>setAuthorizedWallet</code></td><td>user</td><td>Authorize a session wallet to sign <code>Order</code>s only. Pass zero to revoke.</td></tr>
+          <tr><td><code>settleFill</code></td><td>trade admin</td><td>Check two EIP-712 orders (trader or authorizedWallet), take collateral, mint shares, charge the taker fee.</td></tr>
+          <tr><td><code>settleClose</code></td><td>trade admin</td><td>Move shares from seller to buyer and pay the seller, minus the taker fee.</td></tr>
+          <tr><td><code>setTradeAdmin</code></td><td>operator</td><td>Name the only account that may settle fills and closes.</td></tr>
+          <tr><td><code>setTradingFeeFactor</code></td><td>operator</td><td>Set the taker-fee rate. <code>1e18</code> means 1.</td></tr>
+          <tr><td><code>withdrawFees</code></td><td>operator</td><td>Send <code>feePot</code> USDC to an address. This is not user collateral.</td></tr>
+          <tr><td><code>upgradeToAndCall</code></td><td>operator</td><td>Point the proxy at a new implementation.</td></tr>
+        </tbody>
+      </table>
+      <p>Orders are EIP-712 type <code>Order(address trader,bytes32 marketId,uint8 side,uint8 price,uint256 size,uint8 orderType,uint8 tif,uint256 nonce,uint256 salt,uint256 expiresAt)</code>. <code>side</code> 0 is Yes and 1 is No. The domain name is <code>Arizal</code>, version <code>1</code>, and the verifying contract is the proxy.</p>
+
+      <h2 id="api">API</h2>
+      <p>Base URL <code>http://127.0.0.1:8080/v1</code>. JSON in and out. The machine-readable schema is <a href="http://127.0.0.1:8080/v1/openapi.yaml"><code>GET /v1/openapi.yaml</code></a>. The routes below are what the node serves, including the ledger.</p>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td>GET</td><td><code>/health</code></td><td>Liveness. The UI polls this.</td></tr>
+          <tr><td>GET</td><td><code>/version</code></td><td><code>{ git_sha, version }</code>.</td></tr>
+          <tr><td>GET</td><td><code>/config</code></td><td>Chain id, exchange, USDC, aggregator, operator, EIP-712 domain.</td></tr>
+          <tr><td>GET</td><td><code>/markets</code></td><td>All markets.</td></tr>
+          <tr><td>GET</td><td><code>/markets/:id</code></td><td>One market.</td></tr>
+          <tr><td>GET</td><td><code>/markets/:id/book</code></td><td>Aggregated Yes and No depth.</td></tr>
+          <tr><td>GET</td><td><code>/markets/:id/tape?cursor=&amp;limit=</code></td><td>Engine log. <code>limit</code> defaults to 100. <code>cursor</code> is a seq.</td></tr>
+          <tr><td>GET</td><td><code>/markets/:id/chart?tf=</code></td><td>Yes book mid (¢), one sample per minute; live tip from the book. <code>tf</code> is <code>5m</code>, <code>1h</code>, <code>1d</code>, or <code>30d</code>.</td></tr>
+          <tr><td>GET</td><td><code>/markets/:id/holders</code></td><td>Yes and No holders from the positions table.</td></tr>
+          <tr><td>GET</td><td><code>/orders/:id</code></td><td>One order’s status and remaining size.</td></tr>
+          <tr><td>POST</td><td><code>/orders</code></td><td><code>{ order, signature, close? }</code>. Match, then record.</td></tr>
+          <tr><td>DELETE</td><td><code>/orders/:id</code></td><td>Signed cancel of one order.</td></tr>
+          <tr><td>POST</td><td><code>/orders/cancel-all</code></td><td>Signed <code>CancelAll</code>. Optional <code>market_id</code>.</td></tr>
+          <tr><td>POST</td><td><code>/batch</code></td><td>Up to 64 cancels and places, in order. <code>{ results: [...] }</code>.</td></tr>
+          <tr><td>GET</td><td><code>/trades?market=</code></td><td>Recent engine fills. Optional market id.</td></tr>
+          <tr><td>GET</td><td><code>/account?trader=</code></td><td>Collateral, reserved, shares, ETH, open orders.</td></tr>
+          <tr><td>GET</td><td><code>/price</code></td><td>Latest spot and the selected barrier.</td></tr>
+          <tr><td>POST</td><td><code>/faucet/gas</code></td><td><code>{ address }</code>. Operator sends 10 ETH. Local only.</td></tr>
+          <tr><td>GET</td><td><code>/ledger/orders?trader=</code></td><td>Open orders for that wallet.</td></tr>
+          <tr><td>GET</td><td><code>/ledger/trades?trader=</code></td><td>That wallet’s trades, newest first. Includes <code>fee</code> on the taker row.</td></tr>
+          <tr><td>GET</td><td><code>/ledger/positions?trader=</code></td><td>Holdings with shares above 0. No closed-position list.</td></tr>
+          <tr><td>GET</td><td><code>/ledger/funds?trader=</code></td><td>Deposits and withdrawals.</td></tr>
+          <tr><td>POST</td><td><code>/ledger/pending</code></td><td>Mark a wallet tx pending until the chain log arrives.</td></tr>
+          <tr><td>GET</td><td><code>/ws</code></td><td>Websocket. Subscribe with <code>{ "op": "subscribe", "channel": "book"|"tape"|"trades", "market": "..." }</code>. Book snapshots are at most one per market per 80ms.</td></tr>
+        </tbody>
+      </table>
+      <p><code>POST /v1/positions/merge</code> and <code>POST /v1/positions/split</code> do not write the database. The UI sends those calls to the contract. The indexer records them when <code>Split</code> or <code>Merged</code> is logged.</p>
+      <p><a href="/">Back to the book</a></p>
+    </main>
+  </body>
+</html>
