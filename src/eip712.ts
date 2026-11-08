@@ -7,7 +7,7 @@ export const orderTypes = {
     { name: "trader", type: "address" },
     { name: "marketId", type: "string" },
     { name: "side", type: "string" },
-    { name: "price", type: "uint8" },
+    { name: "price", type: "uint16" },
     { name: "size", type: "uint256" },
     { name: "orderType", type: "string" },
     { name: "tif", type: "string" },

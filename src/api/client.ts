@@ -56,6 +56,7 @@ export const api = {
   ledgerOrders: (trader: string) => j<LedgerOrder[]>(`/v1/ledger/orders?trader=${trader}`),
   ledgerTrades: (trader: string) => j<LedgerTrade[]>(`/v1/ledger/trades?trader=${trader}`),
   ledgerPositions: (trader: string) => j<LedgerPos[]>(`/v1/ledger/positions?trader=${trader}`),
+  ledgerClosed: (trader: string) => j<LedgerTrade[]>(`/v1/ledger/closed?trader=${trader}`),
   ledgerFunds: (trader: string) => j<LedgerFund[]>(`/v1/ledger/funds?trader=${trader}`),
   notePending: (body: { trader: string; op: string; amount: string; market_id?: string; tx_hash: string }) =>
     j<{ ok: boolean; status: string }>("/v1/ledger/pending", {

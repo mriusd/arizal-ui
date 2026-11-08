@@ -13,7 +13,7 @@ describe("order payload", () => {
       trader: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
       market_id: "BTC-USD-5M-test",
       side: "Yes",
-      price: 60,
+      price: 600,
       size: 10,
       order_type: "Limit",
       tif: "GTC",
@@ -25,7 +25,7 @@ describe("order payload", () => {
     };
     const m = orderMessage(o);
     expect(m.side).toBe("Yes");
-    expect(m.price).toBe(60);
+    expect(m.price).toBe(600);
     expect(m.size).toBe(10_000_000n);
     expect(m.orderType).toBe("Limit");
     expect(m.tif).toBe("GTC");

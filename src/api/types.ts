@@ -41,10 +41,9 @@ export interface CancelAll {
 export interface CancelAllResult {
   ok: boolean;
   count: number;
-  cancelled: Array<{
-    ok: boolean;
+  /** Present only for failures; successful cancels are counted, not listed. */
+  errors?: Array<{
     order_id?: number;
-    remaining_cancelled?: string;
     market_id?: string;
     error?: string;
   }>;
@@ -129,6 +128,11 @@ export interface Market {
   resolved_at?: number | null;
   /** Latest Yes fill ¢ from the node trades panel; optional. */
   last_yes_price?: number | null;
+  /** Best Yes bid ¢ from the live book (memory); optional on list/WS. */
+  /** Best Yes bid in decicents; optional on list/WS. */
+  best_yes_bid?: number | null;
+  /** Best Yes ask in decicents (`1000 −` best No bid); optional on list/WS. */
+  best_yes_ask?: number | null;
   /** hit | above | between. Default hit for legacy rows. */
   kind?: MarketKind;
   /** Unix seconds when the market expires (UTC midnight). */
@@ -261,6 +265,12 @@ export interface Holders {
   no: Holder[];
 }
 
+/** Per-asset display settings from GET /v1/config. */
+export interface AssetConfig {
+  /** Decimal places for strike and spot formatting (BTC = 0). */
+  price_decimals: number;
+}
+
 export interface Config {
   chain_id: number;
   exchange: `0x${string}`;
@@ -271,6 +281,10 @@ export interface Config {
   eip712: { name: string; version: string };
   gtd_min_secs?: number;
   tif?: Tif[];
+  /** Polymarket-style rate scaled by 1e18 (`7e16` = 0.07). */
+  trading_fee_factor?: string;
+  /** Asset id (lowercase) → display decimals for strikes/spot. */
+  assets?: Record<string, AssetConfig>;
 }
 
 export interface Version {

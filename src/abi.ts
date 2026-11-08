@@ -86,9 +86,12 @@ export const exchangeAbi = [
   },
   {
     type: "function",
-    name: "setAuthorizedWallet",
+    name: "authorizeSession",
     stateMutability: "nonpayable",
-    inputs: [{ name: "wallet", type: "address" }],
+    inputs: [
+      { name: "wallet", type: "address" },
+      { name: "expiresAt", type: "uint64" },
+    ],
     outputs: [],
   },
   {
@@ -97,6 +100,13 @@ export const exchangeAbi = [
     stateMutability: "view",
     inputs: [{ name: "trader", type: "address" }],
     outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "authorizedWalletExpires",
+    stateMutability: "view",
+    inputs: [{ name: "trader", type: "address" }],
+    outputs: [{ type: "uint64" }],
   },
   {
     type: "error",

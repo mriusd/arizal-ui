@@ -10,6 +10,7 @@ import {
 import { formatEther, formatUnits, parseUnits, zeroAddress, type Address, type Hex } from "viem";
 import { getWalletClient } from "wagmi/actions";
 import { api, wsUrl } from "./api/client";
+import { centsToDecicents, complementAsk, decicentsToCents, fmtPriceDecicents, MAX_DECICENTS } from "./price";
 import type {
   Account,
   Book,
@@ -67,10 +68,10 @@ function fmtShares(raw: string | number | null | undefined, fractionDigits = 6):
   });
 }
 
-function levelUsd(price: number, size: string | number): number {
+function levelUsd(priceDecicents: number, size: string | number): number {
   const n = typeof size === "number" ? size : Number(size);
   if (!Number.isFinite(n)) return 0;
-  return (n * price) / 100;
+  return (n * priceDecicents) / 1000;
 }
 
 function fmtUsd(n: number): string {
@@ -89,9 +90,47 @@ function sideBook(book: Book | null, view: Side): { asks: BookLevel[]; bids: Boo
   );
   const opp = live(view === "Yes" ? book.bids_no || [] : book.bids_yes || []);
   const asks = opp
-    .map(([p, sz]) => [100 - Number(p), sz] as BookLevel)
+    .map(([p, sz]) => [1000 - Number(p), sz] as BookLevel)
     .sort((a, b) => a[0] - b[0]);
   return { asks, bids };
+}
+
+/** VWAP in decicents walking `levels` (best first) for `want` shares. Null if no liquidity. */
+function approxVwapDecicents(levels: BookLevel[], want: number): number | null {
+  if (!(want > 0)) {
+    const top = levels[0];
+    return top ? Number(top[0]) : null;
+  }
+  let left = want;
+  let notional = 0;
+  let filled = 0;
+  for (const [p, sz] of levels) {
+    const avail = Number(sz);
+    if (!(avail > 0) || !Number.isFinite(Number(p))) continue;
+    const take = Math.min(left, avail);
+    notional += take * Number(p);
+    filled += take;
+    left -= take;
+    if (left <= 1e-12) break;
+  }
+  if (!(filled > 0)) return null;
+  return notional / filled;
+}
+
+/** Taker fee in USDC. Matches engine `taker_fee` (price in decicents, factor / 1e18). */
+function estimateTakerFeeUsdc(sizeShares: number, priceDecicents: number, factorStr?: string): number {
+  if (!(sizeShares > 0) || !(priceDecicents > 0) || priceDecicents >= 1000) return 0;
+  let factor = 0n;
+  try {
+    factor = BigInt(factorStr || "0");
+  } catch {
+    return 0;
+  }
+  if (factor <= 0n) return 0;
+  const sizeRaw = BigInt(Math.round(sizeShares * 1_000_000));
+  const curve = BigInt(Math.round(priceDecicents)) * BigInt(1000 - Math.round(priceDecicents));
+  const feeRaw = (sizeRaw * factor * curve) / (10n ** 18n * 1_000_000n);
+  return Number(feeRaw) / 1_000_000;
 }
 
 function barrierKey(m: Market): bigint {
@@ -201,15 +240,15 @@ function bestBidAsk(book: Book | null | undefined): TopQuote {
   const yes = live(book.bids_yes || []);
   const no = live(book.bids_no || []);
   const bid = yes.length ? Math.max(...yes.map(([p]) => Number(p))) : null;
-  const ask = no.length ? 100 - Math.max(...no.map(([p]) => Number(p))) : null;
+  const ask = no.length ? 1000 - Math.max(...no.map(([p]) => Number(p))) : null;
   return { bid: bid != null && Number.isFinite(bid) ? bid : null, ask: ask != null && Number.isFinite(ask) ? ask : null };
 }
 
-/** Yes mid in cents from best bid/ask. Matches engine `yes_mid_millicents`. */
+/** Yes mid in display cents from best bid/ask (book levels are decicents). */
 function yesMidCents(book: Book | null | undefined): number | null {
   const { bid, ask } = bestBidAsk(book);
-  if (bid == null || ask == null || bid <= 0 || ask <= 0 || ask > 99) return null;
-  return (bid + ask) / 2;
+  if (bid == null || ask == null || bid <= 0 || ask <= 0 || ask > 990) return null;
+  return (bid + ask) / 20;
 }
 
 function centsNum(raw: string | number | null | undefined): number | null {
@@ -222,12 +261,12 @@ function fmtCents(n: number): string {
   return Number.isInteger(n) ? `${n}` : n.toFixed(1);
 }
 
-function strikeLabel(m: Market): string {
+function strikeLabel(m: Market, priceDp = 0): string {
   const kind = m.kind || "hit";
   if (kind === "between" && m.barrier_high) {
-    return `${fmtBtc(m.barrier)}–${fmtBtc(m.barrier_high)}`;
+    return `${fmtAssetPx(m.barrier, priceDp)}–${fmtAssetPx(m.barrier_high, priceDp)}`;
   }
-  const b = fmtBtc(m.barrier);
+  const b = fmtAssetPx(m.barrier, priceDp);
   if (kind === "hit") {
     return m.direction === "down" ? `${b} ↓` : `${b} ↑`;
   }
@@ -255,24 +294,39 @@ const ASSET_PILL_COLOR: Record<string, string> = {
 };
 
 const KIND_PILL_COLOR: Record<string, string> = {
-  hit: "#3b82f6",
-  above: "#a855f7",
-  between: "#14b8a6",
+  hit: "#6a8fad",
+  above: "#9a7bb8",
+  between: "#4a9e8e",
 };
+
+const TIMEFRAME_PILL_COLOR: Record<string, string> = {
+  daily: "#c4a35a",
+  weekly: "#b8894a",
+  monthly: "#a87878",
+  quarterly: "#7a8aad",
+};
+
+/** API OrderStatus is snake_case (`resting`); tolerate PascalCase too. */
+function isOpenOrderStatus(status: string | undefined): boolean {
+  const s = (status || "").toLowerCase();
+  return s === "resting" || s === "partial" || s === "accepted";
+}
+
+function timeframePillLabel(tf: string): string {
+  if (tf === "weekly") return "Weekly";
+  if (tf === "monthly") return "Monthly";
+  if (tf === "quarterly") return "Quarterly";
+  return "Daily";
+}
 
 function fmtExpiryPill(expiresAt: number | undefined, timeframe?: string): string {
   if (!expiresAt || expiresAt <= 0) return "—";
   const d = new Date(expiresAt * 1000);
-  if (timeframe === "weekly") {
-    return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
-  }
-  if (timeframe === "monthly" || timeframe === "quarterly") {
+  if (timeframe === "quarterly") {
     return d.toLocaleDateString(undefined, { month: "short", year: "2-digit" });
   }
-  return d.toLocaleDateString(undefined, {
-    day: "numeric",
-    month: "short",
-  });
+  // daily / weekly / monthly — day + month (e.g. 10 Nov)
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 function kindPillLabel(kind: string): string {
@@ -299,20 +353,31 @@ function KindPill({ market }: { market?: Market | null }) {
   );
 }
 
+function TimeframePill({ market, timeframe }: { market?: Market | null; timeframe?: string }) {
+  const tf = (timeframe || market?.timeframe || "daily").toLowerCase();
+  return (
+    <span className="mkt-pill" style={pillStyle(TIMEFRAME_PILL_COLOR[tf] || colorFromValue(tf))}>
+      {timeframePillLabel(tf)}
+    </span>
+  );
+}
+
 function StrikePill({
   market,
   marketId,
   spotUsd,
+  priceDp = 0,
 }: {
   market?: Market | null;
   marketId?: string;
   spotUsd?: number | null;
+  priceDp?: number;
 }) {
-  const strike = market ? strikeLabel(market) : "—";
+  const strike = market ? strikeLabel(market, priceDp) : "—";
   const level = strikeUsd(market);
-  let color = "#8b95a8";
+  let color = "#8a969e";
   if (spotUsd != null && level != null) {
-    color = spotUsd >= level ? "#3dd68c" : "#f07178";
+    color = spotUsd >= level ? "#3dba7a" : "#e06a5c";
   }
   return (
     <span className="mkt-pill" style={pillStyle(color)} title={marketId}>
@@ -322,11 +387,11 @@ function StrikePill({
 }
 
 function expiryPillColor(expiresAt: number | undefined, nowSec: number): string {
-  if (!expiresAt || expiresAt <= 0) return "#8b95a8";
+  if (!expiresAt || expiresAt <= 0) return "#8a969e";
   const left = expiresAt - nowSec;
-  if (left < 24 * 3600) return "#f07178";
-  if (left < 72 * 3600) return "#e6b84d";
-  return "#3dd68c";
+  if (left < 24 * 3600) return "#e06a5c";
+  if (left < 72 * 3600) return "#d4a017";
+  return "#3dba7a";
 }
 
 function ExpiryPill({
@@ -350,23 +415,26 @@ function ExpiryPill({
   );
 }
 
-/** [ASSET] [KIND] [STRIKE] [EXPIRY] for lists / titles. */
+/** [ASSET] [KIND] [TIMEFRAME] [STRIKE] [EXPIRY] for lists / titles. */
 function MarketTitlePills({
   market,
   marketId,
   spotUsd,
   nowSec,
+  priceDp = 0,
 }: {
   market?: Market | null;
   marketId: string;
   spotUsd?: number | null;
   nowSec?: number;
+  priceDp?: number;
 }) {
   return (
     <span className="mkt-pills" title={marketId}>
       <AssetPill market={market} marketId={marketId} />
       <KindPill market={market} />
-      <StrikePill market={market} marketId={marketId} spotUsd={spotUsd} />
+      <TimeframePill market={market} />
+      <StrikePill market={market} marketId={marketId} spotUsd={spotUsd} priceDp={priceDp} />
       <ExpiryPill market={market} marketId={marketId} nowSec={nowSec} />
     </span>
   );
@@ -383,6 +451,76 @@ function marketRowKey(m: Market): string {
   return `above:${m.barrier}`;
 }
 
+/** Compact share count for market-grid position pills. */
+function fmtGridShares(raw: string | number): string {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!(n > 0) || !Number.isFinite(n)) return "";
+  if (n >= 100) return n.toFixed(0);
+  if (n >= 10) return n.toFixed(1);
+  return n.toFixed(2).replace(/\.?0+$/, "");
+}
+
+type GridOrderMark = { price: number; rem: number; buy: boolean };
+type GridMine = {
+  yesPos?: number;
+  noPos?: number;
+  yesOrders: GridOrderMark[];
+  noOrders: GridOrderMark[];
+};
+
+function buildGridMine(positions: MinePos[], orders: LedgerOrder[]): Record<string, GridMine> {
+  const out: Record<string, GridMine> = {};
+  const slot = (id: string): GridMine => {
+    let g = out[id];
+    if (!g) {
+      g = { yesOrders: [], noOrders: [] };
+      out[id] = g;
+    }
+    return g;
+  };
+  for (const p of positions) {
+    const n = Number(p.shares);
+    if (!(n > 0)) continue;
+    const g = slot(p.marketId);
+    if (p.side === "Yes") g.yesPos = (g.yesPos || 0) + n;
+    else g.noPos = (g.noPos || 0) + n;
+  }
+  for (const o of orders) {
+    if (!isOpenOrderStatus(o.status)) continue;
+    const rem = Number(o.remaining);
+    if (!(rem > 0)) continue;
+    const px = Number(o.price);
+    if (!Number.isFinite(px)) continue;
+    // Open book rows are buys (sells do not rest). Keep buy/sell for color if that changes.
+    const mark: GridOrderMark = { price: px, rem, buy: true };
+    const g = slot(o.market_id);
+    if (o.side === "Yes") g.yesOrders.push(mark);
+    else g.noOrders.push(mark);
+  }
+  // One pill per side for the highest buy and highest sell only.
+  const bestOf = (marks: GridOrderMark[]): GridOrderMark[] => {
+    let buy: GridOrderMark | undefined;
+    let sell: GridOrderMark | undefined;
+    for (const m of marks) {
+      if (m.buy) {
+        if (!buy || m.price > buy.price) buy = m;
+      } else if (!sell || m.price > sell.price) {
+        sell = m;
+      }
+    }
+    const next: GridOrderMark[] = [];
+    if (buy) next.push(buy);
+    if (sell) next.push(sell);
+    next.sort((a, b) => b.price - a.price);
+    return next;
+  };
+  for (const g of Object.values(out)) {
+    g.yesOrders = bestOf(g.yesOrders);
+    g.noOrders = bestOf(g.noOrders);
+  }
+  return out;
+}
+
 const MarketHistory = memo(function MarketHistory({
   rows,
   mid,
@@ -393,6 +531,8 @@ const MarketHistory = memo(function MarketHistory({
   onMarketsTab,
   marketsTf,
   onMarketsTf,
+  mine,
+  priceDp = 0,
 }: {
   rows: Market[];
   mid: string;
@@ -403,6 +543,8 @@ const MarketHistory = memo(function MarketHistory({
   onMarketsTab: (tab: MarketsKindTab) => void;
   marketsTf: MarketsTfTab;
   onMarketsTf: (tab: MarketsTfTab) => void;
+  mine: Record<string, GridMine>;
+  priceDp?: number;
 }) {
   const kind = marketsTab;
   const live = useMemo(
@@ -438,12 +580,27 @@ const MarketHistory = memo(function MarketHistory({
       row.byExp.set(exp, m);
     }
     return [...map.values()].sort((a, b) =>
-      a.sort < b.sort ? 1 : a.sort > b.sort ? -1 : strikeLabel(a.sample) < strikeLabel(b.sample) ? -1 : 1
+      a.sort < b.sort
+        ? 1
+        : a.sort > b.sort
+          ? -1
+          : strikeLabel(a.sample, priceDp) < strikeLabel(b.sample, priceDp)
+            ? -1
+            : 1
     );
-  }, [live]);
+  }, [live, priceDp]);
 
-  const [quotes, setQuotes] = useState<Record<string, TopQuote>>({});
-  const liveIds = useMemo(() => live.map((m) => m.id).sort().join(","), [live]);
+  // Top-of-book rides the markets list/WS (memory on the node) — no per-cell /book polls.
+  const quotes = useMemo(() => {
+    const next: Record<string, TopQuote> = {};
+    for (const m of live) {
+      next[m.id] = {
+        bid: typeof m.best_yes_bid === "number" ? m.best_yes_bid : null,
+        ask: typeof m.best_yes_ask === "number" ? m.best_yes_ask : null,
+      };
+    }
+    return next;
+  }, [live]);
   const spotLineRef = useRef<HTMLTableRowElement>(null);
 
   // Rows are high→low. Insert the spot marker before the first strike at or below spot.
@@ -455,34 +612,6 @@ const MarketHistory = memo(function MarketHistory({
     }
     return strikeRows.length;
   }, [spotUsd, strikeRows]);
-
-  useEffect(() => {
-    let stop = false;
-    const ids = liveIds ? liveIds.split(",") : [];
-    const load = async () => {
-      if (ids.length === 0) {
-        if (!stop) setQuotes({});
-        return;
-      }
-      const next: Record<string, TopQuote> = {};
-      await Promise.all(
-        ids.map(async (id) => {
-          try {
-            next[id] = bestBidAsk(await api.book(id));
-          } catch {
-            next[id] = { bid: null, ask: null };
-          }
-        })
-      );
-      if (!stop) setQuotes(next);
-    };
-    load();
-    const t = setInterval(load, 2000);
-    return () => {
-      stop = true;
-      clearInterval(t);
-    };
-  }, [liveIds]);
 
   useEffect(() => {
     if (spotInsertAt < 0) return;
@@ -545,7 +674,7 @@ const MarketHistory = memo(function MarketHistory({
                 {i === spotInsertAt ? spotLine : null}
                 <tr>
                   <td className="left strike">
-                    <StrikePill market={row.sample} marketId={row.sample.id} spotUsd={spotUsd} />
+                    <StrikePill market={row.sample} marketId={row.sample.id} spotUsd={spotUsd} priceDp={priceDp} />
                   </td>
                   {expiries.map((e) => {
                     const m = row.byExp.get(e);
@@ -557,17 +686,68 @@ const MarketHistory = memo(function MarketHistory({
                       );
                     }
                     const q = quotes[m.id];
-                    // Best Yes ask / best No ask (No ask = 100 − best Yes bid).
+                    const g = mine[m.id];
+                    // Best Yes ask / best No ask (No ask = 100¢ − best Yes bid; prices are decicents).
                     return (
                       <td key={e} className={m.id === mid ? "me quote" : "quote"} title={m.id}>
-                        <div className="quote-cell">
-                          <button type="button" className="bid" onClick={() => onOpen(m.id, "Yes")}>
-                            {q?.ask != null ? String(q.ask) : <span className="na" aria-label="no yes ask" />}
-                          </button>
-                          <span className="sep">/</span>
-                          <button type="button" className="ask" onClick={() => onOpen(m.id, "No")}>
-                            {q?.bid != null ? String(100 - q.bid) : <span className="na" aria-label="no no ask" />}
-                          </button>
+                        <div className="quote-wrap">
+                          {g && g.yesOrders.length > 0 && (
+                            <div className="cell-orders yes" aria-label="Yes orders">
+                              {g.yesOrders.map((o, i) => (
+                                <span
+                                  key={`y${o.price}-${i}`}
+                                  className={`ord-pill ${o.buy ? "buy" : "sell"}`}
+                                  title={`${o.buy ? "Buy" : "Sell"} Yes ${fmtPriceDecicents(o.price)}¢ × ${fmtGridShares(o.rem)}`}
+                                >
+                                  {fmtPriceDecicents(o.price)}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {g && g.noOrders.length > 0 && (
+                            <div className="cell-orders no" aria-label="No orders">
+                              {g.noOrders.map((o, i) => (
+                                <span
+                                  key={`n${o.price}-${i}`}
+                                  className={`ord-pill ${o.buy ? "buy" : "sell"}`}
+                                  title={`${o.buy ? "Buy" : "Sell"} No ${fmtPriceDecicents(o.price)}¢ × ${fmtGridShares(o.rem)}`}
+                                >
+                                  {fmtPriceDecicents(o.price)}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="quote-cell">
+                            <button type="button" className="bid" onClick={() => onOpen(m.id, "Yes")}>
+                              {q?.ask != null ? (
+                                fmtPriceDecicents(q.ask)
+                              ) : (
+                                <span className="na" aria-label="no yes ask" />
+                              )}
+                            </button>
+                            <span className="sep">/</span>
+                            <button type="button" className="ask" onClick={() => onOpen(m.id, "No")}>
+                              {q?.bid != null ? (
+                                fmtPriceDecicents(complementAsk(q.bid))
+                              ) : (
+                                <span className="na" aria-label="no no ask" />
+                              )}
+                            </button>
+                          </div>
+                          {g && ((g.yesPos != null && g.yesPos > 0) || (g.noPos != null && g.noPos > 0)) && (
+                            <div className="cell-pos">
+                              {g.yesPos != null && g.yesPos > 0 && (
+                                <span className="pos-pill yes" title={`Yes ${fmtGridShares(g.yesPos)}`}>
+                                  {fmtGridShares(g.yesPos)}
+                                </span>
+                              )}
+                              {g.noPos != null && g.noPos > 0 && (
+                                <span className="pos-pill no" title={`No ${fmtGridShares(g.noPos)}`}>
+                                  {fmtGridShares(g.noPos)}
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </td>
                     );
@@ -603,6 +783,8 @@ const MarketPicker = memo(function MarketPicker({
   marketsTf,
   onMarketsTf,
   onOpen,
+  mine,
+  priceDp = 0,
 }: {
   market: Market | null;
   quote: TopQuote;
@@ -616,6 +798,8 @@ const MarketPicker = memo(function MarketPicker({
   marketsTf: MarketsTfTab;
   onMarketsTf: (tab: MarketsTfTab) => void;
   onOpen: (id: string, side: Side) => void;
+  mine: Record<string, GridMine>;
+  priceDp?: number;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -656,22 +840,28 @@ const MarketPicker = memo(function MarketPicker({
           </span>
         </div>
         <div className="market-bar-cell">
+          <span className="lbl">Timeframe</span>
+          <span className="val">
+            <TimeframePill market={market} />
+          </span>
+        </div>
+        <div className="market-bar-cell">
           <span className="lbl">Strike</span>
           <span className="val">
-            <StrikePill market={market} marketId={market?.id} spotUsd={spot} />
+            <StrikePill market={market} marketId={market?.id} spotUsd={spot} priceDp={priceDp} />
           </span>
         </div>
         <div className="market-bar-cell">
           <span className="lbl">Yes / No</span>
           <span className="val market-bar-quote">
-            <span className="bid">{quote.bid != null ? String(quote.bid) : "—"}</span>
+            <span className="bid">{quote.bid != null ? fmtPriceDecicents(quote.bid) : "—"}</span>
             <span className="sep">/</span>
-            <span className="ask">{quote.ask != null ? String(100 - quote.ask) : "—"}</span>
+            <span className="ask">{quote.ask != null ? fmtPriceDecicents(complementAsk(quote.ask)) : "—"}</span>
           </span>
         </div>
         <div className="market-bar-cell">
           <span className="lbl">Spot</span>
-          <span className="val">{spot != null ? `$${spot.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}</span>
+          <span className="val">{fmtSpotUsd(spot, priceDp)}</span>
         </div>
         <div className="market-bar-cell">
           <span className="lbl">Δ spot</span>
@@ -702,6 +892,8 @@ const MarketPicker = memo(function MarketPicker({
             marketsTf={marketsTf}
             onMarketsTf={onMarketsTf}
             onOpen={onOpen}
+            mine={mine}
+            priceDp={priceDp}
           />
         </div>
       )}
@@ -719,8 +911,10 @@ type ChartTf = (typeof CHART_TF)[number][0];
 
 const UI_PREFS_KEY = "clearbook.ui";
 
+type MineTab = "positions" | "closed" | "orders" | "trades" | "funds";
+
 type UiPrefs = {
-  mineTab: "positions" | "orders" | "trades" | "funds";
+  mineTab: MineTab;
   chartTf: ChartTf;
   marketsTab: MarketsKindTab;
   marketsTf: MarketsTfTab;
@@ -758,7 +952,7 @@ function readUiPrefs(): UiPrefs {
     const price = Number(v.price);
     const expiresAt = Number(v.expiresAt);
     return {
-      mineTab: oneOf(v.mineTab, ["positions", "orders", "trades", "funds"], d.mineTab),
+      mineTab: oneOf(v.mineTab, ["positions", "closed", "orders", "trades", "funds"], d.mineTab),
       chartTf: oneOf(v.chartTf, ["5m", "1h", "1d", "30d"], d.chartTf),
       marketsTab: oneOf(v.marketsTab, ["hit", "above", "between"], d.marketsTab),
       marketsTf: oneOf(v.marketsTf, ["daily", "weekly", "monthly", "quarterly"], d.marketsTf),
@@ -780,7 +974,30 @@ function fmtChartTick(ts: number, spanSec: number): string {
   if (spanSec >= 24 * 60 * 60) {
     return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   }
+  if (spanSec >= 60 * 60) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** Even time ticks across [start, end], including endpoints (~max interior steps). */
+function chartTimeTicks(start: number, end: number, maxInterior = 5): number[] {
+  const span = Math.max(1, end - start);
+  const steps = [30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+  let step = steps[steps.length - 1];
+  for (const c of steps) {
+    if (span / c <= maxInterior + 1) {
+      step = c;
+      break;
+    }
+  }
+  const ticks: number[] = [start];
+  const first = Math.ceil((start + 1e-9) / step) * step;
+  for (let t = first; t < end - step * 0.25; t += step) {
+    if (t > start + step * 0.2) ticks.push(t);
+  }
+  ticks.push(end);
+  return ticks;
 }
 
 function shortTx(tx?: string): string {
@@ -814,22 +1031,38 @@ function marketIdFromPath(path: string): string {
   return p;
 }
 
-function fmtBtc(raw: string | number | null | undefined): string {
-  if (raw == null || raw === "") return "—";
-  let x: bigint;
-  try {
-    x = BigInt(typeof raw === "number" ? Math.trunc(raw).toString() : raw);
-  } catch {
-    return "—";
-  }
-  const neg = x < 0n;
-  const a = neg ? -x : x;
-  if (a > 10n ** 12n) {
-    const whole = a / 10n ** 18n;
-    const frac = (a % 10n ** 18n) / 10n ** 16n;
-    return `${neg ? "-" : ""}${whole}.${frac.toString().padStart(2, "0")}`;
-  }
-  return `${neg ? "-" : ""}${(Number(a) / 1e8).toFixed(2)}`;
+/** Asset id from market id / symbol (`btc-hit-…` → `btc`). */
+function marketAsset(m?: { id?: string; symbol?: string } | null): string {
+  const raw = (m?.symbol || m?.id || "btc").toLowerCase();
+  const head = raw.split(/[-_]/)[0];
+  return head || "btc";
+}
+
+/** Display decimals for an asset from GET /v1/config (`assets.<id>.price_decimals`). */
+function priceDpFor(cfg: Config | null | undefined, asset = "btc"): number {
+  const row = cfg?.assets?.[asset.toLowerCase()] ?? cfg?.assets?.btc;
+  const n = row?.price_decimals;
+  return typeof n === "number" && n >= 0 ? Math.min(18, Math.floor(n)) : 0;
+}
+
+/** Format oracle/barrier fixed-point using the asset's configured decimal places. */
+function fmtAssetPx(raw: string | number | null | undefined, dp = 0): string {
+  const n = pxToUsd(raw);
+  if (n == null) return "—";
+  const neg = n < 0;
+  const body = Math.abs(n).toLocaleString(undefined, {
+    minimumFractionDigits: dp,
+    maximumFractionDigits: dp,
+  });
+  return `${neg ? "-" : ""}${body}`;
+}
+
+function fmtSpotUsd(n: number | null | undefined, dp = 0): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `$${n.toLocaleString(undefined, {
+    minimumFractionDigits: dp,
+    maximumFractionDigits: dp,
+  })}`;
 }
 
 /** USD number from 8- or 18-decimal chain/oracle fixed-point. */
@@ -860,6 +1093,21 @@ function strikeUsd(m: Market | null | undefined): number | null {
   return lo;
 }
 
+/** Matches node `market_resolved_key` (kind + barrier [+ high] + expiry; hit ignores up/down). */
+function marketResolvedKey(m: Market | null | undefined): string | null {
+  if (!m) return null;
+  const lo = pxToUsd(m.barrier);
+  if (lo == null) return null;
+  const barrier = Math.floor(lo).toString();
+  const kind = m.kind || "hit";
+  const exp = m.expires_at ?? 0;
+  if (kind === "hit") return `hit:${barrier}:${exp}`;
+  if (kind === "above") return `above:${barrier}:${exp}`;
+  const hiRaw = pxToUsd(m.barrier_high);
+  const hi = hiRaw == null ? barrier : Math.floor(hiRaw).toString();
+  return `between:${barrier}:${hi}:${exp}`;
+}
+
 function fmtCountdown(expiresAt: number | undefined, now: number): string {
   if (!expiresAt || expiresAt <= 0) return "—";
   let s = Math.max(0, expiresAt - now);
@@ -872,6 +1120,16 @@ function fmtCountdown(expiresAt: number | undefined, now: number): string {
   const sec = s % 60;
   if (d > 0) return `${d}d ${h}h ${m.toString().padStart(2, "0")}m`;
   return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+}
+
+/** >1d green, <1d yellow, <8h red. */
+function countdownTone(expiresAt: number | undefined, now: number): "ok" | "warn" | "hot" | "muted" {
+  if (!expiresAt || expiresAt <= 0) return "muted";
+  const left = expiresAt - now;
+  if (left <= 0) return "hot";
+  if (left < 8 * 3600) return "hot";
+  if (left < 24 * 3600) return "warn";
+  return "ok";
 }
 
 /** Compact time-to-expiry: `3d` when ≥1d, else `5h`. */
@@ -899,7 +1157,7 @@ export function App() {
   const publicClient = usePublicClient({ chainId: localChain.id });
   const { writeContractAsync: writeInjected } = useWriteContract();
   const onHardhat = walletChainId === localChain.id;
-  /** On-chain authorizedWallet matches the browser-stored session key. */
+  /** On-chain authorizeSession wallet matches the browser key and is unexpired. */
   const [tradingEnabled, setTradingEnabled] = useState(false);
 
   const [cfg, setCfg] = useState<Config | null>(null);
@@ -911,11 +1169,15 @@ export function App() {
   const [trades, setTrades] = useState<Fill[]>([]);
   const [fillTx, setFillTx] = useState<Record<number, string>>({});
   const [chart, setChart] = useState<MarketChart | null>(null);
+  /** Resolved markets for the current kind/strike (WS `resolved` channel). */
+  const [resolvedStrike, setResolvedStrike] = useState<Market[]>([]);
   const [savedUi] = useState(readUiPrefs);
   const [settledLocal, setSettledLocal] = useState<Set<string>>(() => new Set());
   const [mineTab, setMineTab] = useState(savedUi.mineTab);
   const [positions, setPositions] = useState<MinePos[]>([]);
   const [myFills, setMyFills] = useState<MyFill[]>([]);
+  /** Closed positions tab — closes + redeems from ledger / WS `closed_positions`. */
+  const [closedFills, setClosedFills] = useState<MyFill[]>([]);
   const [dbOrders, setDbOrders] = useState<LedgerOrder[]>([]);
   const [funds, setFunds] = useState<LedgerFund[]>([]);
   const [lastYes, setLastYes] = useState<Record<string, number>>({});
@@ -965,8 +1227,10 @@ export function App() {
     traderRef.current = trader;
     acctFundTxRef.current = new Set();
   }
+  const priceDp = priceDpFor(cfg, marketAsset(market));
   const depth = useMemo(() => sideBook(book, side), [book, side]);
   const mineLevels = useMemo(() => userBookLevels(dbOrders, mid, side), [dbOrders, mid, side]);
+  const gridMine = useMemo(() => buildGridMine(positions, dbOrders), [positions, dbOrders]);
   const bookSeqRef = useRef(-1);
 
   const patchChartMid = useCallback((midPx: number | null) => {
@@ -1032,47 +1296,134 @@ export function App() {
     [openMarket]
   );
 
-  const applyLedgerSnapshot = useCallback((poss: LedgerPos[], ledgerTrades: LedgerTrade[]) => {
-    const ms = marketsRef.current;
-    const fills: MyFill[] = ledgerTrades.map((t) => ({
-      id: t.id,
-      marketId: t.market_id,
-      side: t.side,
-      price: t.price,
-      yesPrice: t.yes_price,
-      shares: Number(t.size),
-      ts: t.ts,
-      closing: t.closing,
-      isTaker: t.is_taker,
-      pnl: t.pnl,
-      fee: t.fee,
-      op: t.op || "trade",
-      status: t.status || "confirmed",
-      txHash: t.tx_hash,
-      logIndex: t.log_index,
-      block: t.block,
-    }));
-    const rows: MinePos[] = poss.map((p) => {
-      const mkt = ms.find((x) => x.id === p.market_id);
-      return {
-        marketId: p.market_id,
-        barrier: mkt?.barrier || "0",
-        side: p.side,
-        shares: p.shares,
-        usdc: p.usdc_staked,
-        redeemed: !!p.redeemed,
-      };
+  /** Upsert one market from WS `{ channel: market, op: "opened" }` (full list is not resent on open). */
+  const upsertMarket = useCallback((m: Market) => {
+    setMarkets((prev) => {
+      const i = prev.findIndex((x) => x.id === m.id);
+      if (i < 0) return [m, ...prev];
+      const next = prev.slice();
+      next[i] = m;
+      return next;
     });
-    rows.sort((a, b) => {
-      const d = barrierKey({ barrier: b.barrier } as Market) - barrierKey({ barrier: a.barrier } as Market);
-      if (d > 0n) return 1;
-      if (d < 0n) return -1;
-      return a.marketId < b.marketId ? -1 : a.marketId > b.marketId ? 1 : a.side === b.side ? 0 : a.side === "Yes" ? -1 : 1;
-    });
-    fills.sort((a, b) => b.ts - a.ts || (b.id ?? 0) - (a.id ?? 0));
-    setMyFills(fills);
-    setPositions(rows);
   }, []);
+
+  const mapLedgerTrades = useCallback((ledgerTrades: LedgerTrade[], ms: Market[]): MyFill[] => {
+    const hexRe = /^0x[0-9a-fA-F]{64}$/;
+    const hashToSlug = new Map<string, string>();
+    for (const m of ms) hashToSlug.set(marketIdHash(m.id).toLowerCase(), m.id);
+    for (const t of ledgerTrades) {
+      if (!hexRe.test(t.market_id)) hashToSlug.set(marketIdHash(t.market_id).toLowerCase(), t.market_id);
+    }
+    const resolveMid = (id: string) => (hexRe.test(id) ? hashToSlug.get(id.toLowerCase()) || id : id);
+    const statusRank = (s: string) => (s === "confirmed" ? 0 : s === "pending" ? 1 : 2);
+    const orderedTrades = [...ledgerTrades].sort((a, b) => {
+      const sr = statusRank(a.status || "confirmed") - statusRank(b.status || "confirmed");
+      if (sr !== 0) return sr;
+      return Number(hexRe.test(a.market_id)) - Number(hexRe.test(b.market_id));
+    });
+    const seenTx = new Set<string>();
+    const seenSize = new Set<string>();
+    const fills: MyFill[] = [];
+    for (const t of orderedTrades) {
+      const id = resolveMid(t.market_id);
+      const op = t.op || "trade";
+      const tx = (t.tx_hash || "").toLowerCase();
+      const sizeKey = `${id}:${t.side}:${t.size}:${t.price}:${op}`;
+      if (tx.startsWith("0x")) {
+        const txKey = `${id}:${t.side}:${tx}:${op}`;
+        if (seenTx.has(txKey) || seenSize.has(sizeKey)) continue;
+        seenTx.add(txKey);
+        seenSize.add(sizeKey);
+      } else {
+        if (seenSize.has(sizeKey)) continue;
+        seenSize.add(sizeKey);
+      }
+      fills.push({
+        id: t.id,
+        marketId: id,
+        side: t.side,
+        price: t.price,
+        yesPrice: t.yes_price,
+        shares: Number(t.size),
+        ts: t.ts,
+        closing: t.closing,
+        isTaker: t.is_taker,
+        pnl: t.pnl,
+        fee: t.fee,
+        op,
+        status: t.status || "confirmed",
+        txHash: t.tx_hash,
+        logIndex: t.log_index,
+        block: t.block,
+      });
+    }
+    fills.sort((a, b) => b.ts - a.ts || (b.id ?? 0) - (a.id ?? 0));
+    return fills;
+  }, []);
+
+  const applyClosedSnapshot = useCallback(
+    (closedTrades: LedgerTrade[]) => {
+      setClosedFills(mapLedgerTrades(closedTrades, marketsRef.current));
+    },
+    [mapLedgerTrades]
+  );
+
+  const applyLedgerSnapshot = useCallback(
+    (poss: LedgerPos[], ledgerTrades: LedgerTrade[], closedTrades?: LedgerTrade[]) => {
+      const ms = marketsRef.current;
+      // Drop duplicate rows keyed by bytes32 hex when the slug row already exists.
+      const hexRe = /^0x[0-9a-fA-F]{64}$/;
+      const hashToSlug = new Map<string, string>();
+      for (const m of ms) hashToSlug.set(marketIdHash(m.id).toLowerCase(), m.id);
+      for (const p of poss) {
+        if (!hexRe.test(p.market_id)) hashToSlug.set(marketIdHash(p.market_id).toLowerCase(), p.market_id);
+      }
+      for (const t of ledgerTrades) {
+        if (!hexRe.test(t.market_id)) hashToSlug.set(marketIdHash(t.market_id).toLowerCase(), t.market_id);
+      }
+      const resolveMid = (id: string) => (hexRe.test(id) ? hashToSlug.get(id.toLowerCase()) || id : id);
+
+      const seenPos = new Set<string>();
+      const rows: MinePos[] = [];
+      const orderedPos = [...poss].sort((a, b) => Number(hexRe.test(a.market_id)) - Number(hexRe.test(b.market_id)));
+      for (const p of orderedPos) {
+        const id = resolveMid(p.market_id);
+        const key = `${id}:${p.side}`;
+        if (seenPos.has(key)) continue;
+        seenPos.add(key);
+        const mkt = ms.find((x) => x.id === id);
+        rows.push({
+          marketId: id,
+          barrier: mkt?.barrier || "0",
+          side: p.side,
+          shares: p.shares,
+          usdc: p.usdc_staked,
+          redeemed: !!p.redeemed,
+        });
+      }
+      rows.sort((a, b) => {
+        const d = barrierKey({ barrier: b.barrier } as Market) - barrierKey({ barrier: a.barrier } as Market);
+        if (d > 0n) return 1;
+        if (d < 0n) return -1;
+        return a.marketId < b.marketId ? -1 : a.marketId > b.marketId ? 1 : a.side === b.side ? 0 : a.side === "Yes" ? -1 : 1;
+      });
+
+      setMyFills(mapLedgerTrades(ledgerTrades, ms));
+      setPositions(rows);
+      if (closedTrades) {
+        setClosedFills(mapLedgerTrades(closedTrades, ms));
+      } else {
+        // Fallback until node sends `closed`: seller closes + redeems from trades.
+        setClosedFills(
+          mapLedgerTrades(
+            ledgerTrades.filter((t) => !!t.closing || t.op === "settle"),
+            ms
+          )
+        );
+      }
+    },
+    [mapLedgerTrades]
+  );
 
   /** Wallet ledger only. Account is fetched separately and sparsely — it hits chain RPC. */
   const refresh = useCallback(async () => {
@@ -1082,18 +1433,20 @@ export function App() {
         setDbOrders([]);
         setPositions([]);
         setMyFills([]);
+        setClosedFills([]);
         setFunds([]);
         return;
       }
-      const [orders, ledgerTrades, poss, cash] = await Promise.all([
+      const [orders, ledgerTrades, poss, closed, cash] = await Promise.all([
         api.ledgerOrders(trader).catch(() => []),
         api.ledgerTrades(trader).catch(() => []),
         api.ledgerPositions(trader).catch(() => []),
+        api.ledgerClosed(trader).catch(() => [] as LedgerTrade[]),
         api.ledgerFunds(trader).catch(() => []),
       ]);
       setFunds(cash);
       setDbOrders(orders);
-      applyLedgerSnapshot(poss, ledgerTrades);
+      applyLedgerSnapshot(poss, ledgerTrades, closed);
     } catch (e: unknown) {
       const msg = String(e);
       if (e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(msg)) {
@@ -1249,6 +1602,7 @@ export function App() {
       s.send(JSON.stringify({ op: "subscribe", channel: "book", market: id }));
       s.send(JSON.stringify({ op: "subscribe", channel: "tape", market: id }));
       s.send(JSON.stringify({ op: "subscribe", channel: "trades", market: id }));
+      s.send(JSON.stringify({ op: "subscribe", channel: "resolved", market: id }));
     };
     const sub = (s: WebSocket) => {
       if (s.readyState !== WebSocket.OPEN) return;
@@ -1289,7 +1643,9 @@ export function App() {
       ws.onmessage = (ev) => {
         let v: {
           channel?: string;
-          market?: string;
+          /** Market id (most channels) or full market row (`channel: market`, `op: opened`). */
+          market?: string | Market;
+          strike?: string;
           seq?: number;
           bids_yes?: Book["bids_yes"];
           bids_no?: Book["bids_no"];
@@ -1298,6 +1654,8 @@ export function App() {
           fill?: Fill;
           fills?: Fill[];
           markets?: Market[];
+          best_yes_bid?: number | null;
+          best_yes_ask?: number | null;
           price?: string | number;
           spot?: string;
           barrier?: string;
@@ -1309,6 +1667,8 @@ export function App() {
           tx_hash?: string;
           positions?: LedgerPos[];
           trades?: LedgerTrade[];
+          closed?: LedgerTrade[];
+          orders?: LedgerOrder[];
         };
         try {
           v = JSON.parse(ev.data);
@@ -1316,8 +1676,56 @@ export function App() {
           return;
         }
         const id = midRef.current;
+        const msgMarketId =
+          typeof v.market === "string" ? v.market : v.market && typeof v.market === "object" ? v.market.id : undefined;
         if (v.channel === "markets" && Array.isArray(v.markets)) {
           applyMarkets(v.markets);
+          return;
+        }
+        if (v.channel === "market" && v.op === "opened" && v.market && typeof v.market === "object") {
+          upsertMarket(v.market);
+          return;
+        }
+        if (v.channel === "resolved" && Array.isArray(v.markets)) {
+          const cur = marketsRef.current.find((m) => m.id === id);
+          const want = marketResolvedKey(cur);
+          if (
+            msgMarketId === id ||
+            (want && v.strike === want) ||
+            (want && v.markets.some((m) => marketResolvedKey(m) === want))
+          ) {
+            setResolvedStrike(v.markets);
+          }
+          return;
+        }
+        if (
+          v.channel === "quote" &&
+          msgMarketId &&
+          (v.best_yes_bid !== undefined || v.best_yes_ask !== undefined)
+        ) {
+          const bid =
+            typeof v.best_yes_bid === "number"
+              ? v.best_yes_bid
+              : v.best_yes_bid == null
+                ? null
+                : Number(v.best_yes_bid);
+          const ask =
+            typeof v.best_yes_ask === "number"
+              ? v.best_yes_ask
+              : v.best_yes_ask == null
+                ? null
+                : Number(v.best_yes_ask);
+          setMarkets((ms) =>
+            ms.map((m) =>
+              m.id === msgMarketId
+                ? {
+                    ...m,
+                    best_yes_bid: Number.isFinite(bid as number) ? (bid as number) : null,
+                    best_yes_ask: Number.isFinite(ask as number) ? (ask as number) : null,
+                  }
+                : m
+            )
+          );
           return;
         }
         if (v.channel === "price") {
@@ -1325,14 +1733,14 @@ export function App() {
           if (raw) setSpotRaw(raw);
           return;
         }
-        if (v.channel === "last_yes" && v.market && v.price != null) {
+        if (v.channel === "last_yes" && msgMarketId && v.price != null) {
           const px = typeof v.price === "number" ? v.price : Number(v.price);
           if (!(px > 0) || px >= 100) return;
-          setMarkets((ms) => ms.map((m) => (m.id === v.market ? { ...m, last_yes_price: px } : m)));
-          setLastYes((m) => ({ ...m, [v.market!]: px }));
+          setMarkets((ms) => ms.map((m) => (m.id === msgMarketId ? { ...m, last_yes_price: px } : m)));
+          setLastYes((m) => ({ ...m, [msgMarketId]: px }));
           return;
         }
-        if (v.channel === "tape_snapshot" && v.market === id && Array.isArray(v.events)) {
+        if (v.channel === "tape_snapshot" && msgMarketId === id && Array.isArray(v.events)) {
           const tape = v.events;
           const tx: Record<number, string> = {};
           for (const e of tape) {
@@ -1341,13 +1749,13 @@ export function App() {
           setFillTx(tx);
           return;
         }
-        if (v.channel === "trades_snapshot" && v.market === id && Array.isArray(v.fills)) {
+        if (v.channel === "trades_snapshot" && msgMarketId === id && Array.isArray(v.fills)) {
           setTrades(v.fills);
           return;
         }
-        if (v.channel === "book" && v.market === id) {
+        if (v.channel === "book" && msgMarketId === id) {
           applyBook({
-            market_id: v.market,
+            market_id: msgMarketId,
             bids_yes: v.bids_yes || [],
             bids_no: v.bids_no || [],
             seq: v.seq ?? 0,
@@ -1389,7 +1797,16 @@ export function App() {
         } else if (v.channel === "ledger" && v.trader && Array.isArray(v.positions) && Array.isArray(v.trades)) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
-          applyLedgerSnapshot(v.positions, v.trades);
+          const closed = Array.isArray(v.closed) ? (v.closed as LedgerTrade[]) : undefined;
+          applyLedgerSnapshot(v.positions, v.trades, closed);
+        } else if (v.channel === "closed_positions" && v.trader && Array.isArray(v.closed)) {
+          const me = traderRef.current?.toLowerCase();
+          if (!me || String(v.trader).toLowerCase() !== me) return;
+          applyClosedSnapshot(v.closed as LedgerTrade[]);
+        } else if (v.channel === "orders" && v.trader && Array.isArray(v.orders)) {
+          const me = traderRef.current?.toLowerCase();
+          if (!me || String(v.trader).toLowerCase() !== me) return;
+          setDbOrders(v.orders);
         } else if (v.channel === "account" && v.trader && v.amount != null) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
@@ -1435,17 +1852,19 @@ export function App() {
       wsRef.current = null;
       sock?.close();
     };
-  }, [applyBook, applyMarkets, applyLedgerSnapshot]);
+  }, [applyBook, applyMarkets, upsertMarket, applyLedgerSnapshot, applyClosedSnapshot]);
 
   useEffect(() => {
     bookSeqRef.current = -1;
     setTrades([]);
     setFillTx({});
+    setResolvedStrike([]);
     const ws = wsRef.current;
     if (!mid || !ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ op: "subscribe", channel: "book", market: mid }));
     ws.send(JSON.stringify({ op: "subscribe", channel: "tape", market: mid }));
     ws.send(JSON.stringify({ op: "subscribe", channel: "trades", market: mid }));
+    ws.send(JSON.stringify({ op: "subscribe", channel: "resolved", market: mid }));
   }, [mid]);
 
   useEffect(() => {
@@ -1512,13 +1931,24 @@ export function App() {
       return;
     }
     try {
-      const onChain = (await publicClient.readContract({
-        address: cfg.exchange,
-        abi: exchangeAbi,
-        functionName: "authorizedWallet",
-        args: [trader as Address],
-      })) as Address;
-      setTradingEnabled(onChain.toLowerCase() === wallet.address.toLowerCase());
+      const [onChain, expiresAt] = await Promise.all([
+        publicClient.readContract({
+          address: cfg.exchange,
+          abi: exchangeAbi,
+          functionName: "authorizedWallet",
+          args: [trader as Address],
+        }) as Promise<Address>,
+        publicClient.readContract({
+          address: cfg.exchange,
+          abi: exchangeAbi,
+          functionName: "authorizedWalletExpires",
+          args: [trader as Address],
+        }) as Promise<bigint>,
+      ]);
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      setTradingEnabled(
+        onChain.toLowerCase() === wallet.address.toLowerCase() && expiresAt > now,
+      );
     } catch {
       setTradingEnabled(false);
     }
@@ -1531,16 +1961,17 @@ export function App() {
       await ensureHardhat();
       let wallet = loadTradingAccount(trader as Address);
       if (!wallet) wallet = createTradingAccount(trader as Address);
+      const expiresAt = BigInt(Math.floor(Date.now() / 1000) + 24 * 60 * 60);
       await writeAsUser({
         chainId: localChain.id,
         address: cfg.exchange,
         abi: exchangeAbi,
-        functionName: "setAuthorizedWallet",
-        args: [wallet.address],
+        functionName: "authorizeSession",
+        args: [wallet.address, expiresAt],
         nonce: await latestNonce(),
       });
       setTradingEnabled(true);
-      setMsg(`trading enabled · ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}`);
+      setMsg(`trading enabled · 24h · ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}`);
     } catch (e: unknown) {
       setErr(explainErr(e));
     }
@@ -1555,8 +1986,8 @@ export function App() {
         chainId: localChain.id,
         address: cfg.exchange,
         abi: exchangeAbi,
-        functionName: "setAuthorizedWallet",
-        args: [zeroAddress],
+        functionName: "authorizeSession",
+        args: [zeroAddress, 0n],
         nonce: await latestNonce(),
       });
       clearTradingAccount(trader as Address);
@@ -1698,7 +2129,8 @@ export function App() {
   }) {
     if (!cfg || !trader) return;
     setErr("");
-    const px = opts.market ? (opts.close ? 0 : 99) : opts.price;
+    const pxCents = opts.market ? (opts.close ? 0 : 99) : opts.price;
+    const px = opts.market ? (opts.close ? 0 : MAX_DECICENTS) : centsToDecicents(opts.price);
     const useTif: Tif = opts.market ? "FAK" : opts.tif;
     try {
       await ensureHardhat();
@@ -1708,13 +2140,13 @@ export function App() {
         throw new Error(`GTD expires_at must be unix seconds ≥ ${minGtd} (now+60s)`);
       }
       // Buys soft-lock USDC only for this market + Yes/No side (same deposit can cover every market).
-      const need = Math.floor(((Number(opts.size) || 0) * px * 1_000_000) / 100);
+      const need = Math.floor(((Number(opts.size) || 0) * px * 1_000_000) / 1000);
       const sideReserved = (acct?.open_orders ?? [])
         .filter((o) => o.market_id === opts.marketId && o.side === opts.side)
         .reduce((sum, o) => {
           const rem = Number(o.remaining);
           if (!Number.isFinite(rem)) return sum;
-          return sum + Math.floor((rem * 1_000_000 * o.price) / 100);
+          return sum + Math.floor((rem * 1_000_000 * o.price) / 1000);
         }, 0);
       const have = (acct?.collateral ?? 0) - sideReserved;
       if (!opts.close && acct && have < need) {
@@ -1740,7 +2172,7 @@ export function App() {
       const r = await api.place({ order, signature, close: opts.close || undefined });
       if ((r.fills?.length ?? 0) === 0 && r.reason) {
         const why = r.reason === "fak remainder"
-          ? `no ${opts.side.toUpperCase()} bid at or above ${px || "market"}¢`
+          ? `no ${opts.side.toUpperCase()} bid at or above ${pxCents || "market"}¢`
           : r.reason;
         setErr(`order #${r.order_id} cancelled: ${why}`);
       } else {
@@ -1895,7 +2327,7 @@ export function App() {
   return (
     <>
       <header>
-        <span className="brand">arizal.xyz</span>
+        <span className="brand">arizal<span>.xyz</span></span>
         <a className="docs" href="/docs.html">docs</a>
         {(apiDown || wsDown) && <span className="conn-down">connection failed, reconnecting</span>}
         <div className="connect">
@@ -1936,6 +2368,8 @@ export function App() {
         onMarketsTab={setMarketsTab}
         marketsTf={marketsTf}
         onMarketsTf={setMarketsTf}
+        mine={gridMine}
+        priceDp={priceDp}
         onOpen={(id, nextSide) => {
           openMarket(id, "push", nextSide);
           setMarketsOpen(false);
@@ -1945,6 +2379,74 @@ export function App() {
         <div className="panel chart">
           <div className="chart-head">
             {market?.status === "Resolved" && <div className="resolved">RESOLVED</div>}
+            {(market?.kind || "hit") === "hit" && (
+              <div className="resolved-history">
+                <button type="button" className="history-btn" aria-label="Resolved market history" title="Resolved history">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      d="M12 8v5l3 2"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M3.5 12a8.5 8.5 0 1 0 2.2-5.6"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                    <path d="M3.5 4.5v4h4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {resolvedStrike.length > 0 && <span className="history-count">{resolvedStrike.length}</span>}
+                </button>
+                <div className="resolved-drop" role="menu">
+                  <div className="resolved-drop-head">Resolved markets</div>
+                  {resolvedStrike.length === 0 ? (
+                    <div className="empty">no prior resolves for this expiry</div>
+                  ) : (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>resolved</th>
+                          <th>dir</th>
+                          <th>expiry</th>
+                          <th>winner</th>
+                          <th>spot</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {resolvedStrike.map((m) => (
+                          <tr
+                            key={m.id}
+                            className={m.id === mid ? "me" : undefined}
+                            onClick={() => openMarket(m.id, "push")}
+                            title={m.id}
+                          >
+                            <td>{fmtResolvedAt(m.resolved_at)}</td>
+                            <td className={m.direction === "up" ? "yes" : "no"}>
+                              {(m.direction || "up").toUpperCase()}
+                            </td>
+                            <td>
+                              <ExpiryPill market={m} marketId={m.id} nowSec={nowSec} />
+                            </td>
+                            <td className={m.winning_side === "Yes" ? "yes" : m.winning_side === "No" ? "no" : undefined}>
+                              {m.winning_side?.toUpperCase() || "—"}
+                            </td>
+                            <td className="mono">{fmtAssetPx(m.resolution_price, priceDpFor(cfg, marketAsset(m)))}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
+            {market?.status !== "Resolved" && market?.expires_at ? (
+              <span className={`chart-countdown ${countdownTone(market.expires_at, nowSec)}`} title="Time to expiry">
+                {fmtCountdown(market.expires_at, nowSec)}
+              </span>
+            ) : null}
             <div className="tabs tf-tabs">
               {CHART_TF.map(([label]) => (
                 <button key={label} className={chartTf === label ? "active" : ""} onClick={() => setChartTf(label)}>
@@ -1958,7 +2460,7 @@ export function App() {
             startTs={chart?.start_ts ?? 0}
             endTs={chart?.end_ts || chart?.now_ts || nowSec}
             nowTs={chart?.now_ts ?? nowSec}
-            color={invertSide ? "#f07178" : "#3dd68c"}
+            color={invertSide ? "#e06a5c" : "#3dba7a"}
           />
         </div>
 
@@ -1981,6 +2483,28 @@ export function App() {
             <button onClick={deposit}>deposit</button>
             <button onClick={withdraw}>withdraw</button>
           </div>
+          {walletOn && (
+            <div className="session-auth">
+              {tradingEnabled ? (
+                <>
+                  <span className="ok">session wallet authorized</span>
+                  {" · "}
+                  <button type="button" className="link" onClick={() => void disableTrading()}>
+                    revoke
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="link"
+                  disabled={!cfg}
+                  onClick={() => void enableTrading()}
+                >
+                  Enable 1-click trading
+                </button>
+              )}
+            </div>
+          )}
           {market?.status === "Resolved" &&
             (positions.some((p) => p.marketId === mid && (p.redeemed || settledLocal.has(p.marketId))) ? (
               <span className="sha">Redeemed</span>
@@ -2003,16 +2527,6 @@ export function App() {
               </button>
             </div>
           </div>
-          <div className="sha" title={mid}>
-            {mid}
-          </div>
-          <div className="sha">
-            {market?.direction || "—"} barrier {fmtBtc(market?.barrier)}
-            {market?.status === "Resolved" ? ` · hit ${fmtBtc(market?.resolution_price)}` : ""}
-            {depth.bids[0] && depth.asks[0]
-              ? ` · spread ${depth.asks[0][0] - depth.bids[0][0]}¢`
-              : ""}
-          </div>
           <BookLadder
             asks={depth.asks}
             bids={depth.bids}
@@ -2025,20 +2539,6 @@ export function App() {
         <div className="panel place">
           <h2>Place order</h2>
           <div className="stack">
-            {walletOn && (
-              <div className="row">
-                {tradingEnabled ? (
-                  <>
-                    <span className="ok">trading on</span>
-                    <button onClick={() => void disableTrading()}>Disable Trading</button>
-                  </>
-                ) : (
-                  <button className="primary" disabled={!cfg} onClick={() => void enableTrading()}>
-                    Enable Trading
-                  </button>
-                )}
-              </div>
-            )}
             {entryKind !== "merge" && entryKind !== "split" && (
               <>
                 <div className="row">
@@ -2072,12 +2572,33 @@ export function App() {
               {entryKind === "limit" && (
                 <div className="field">
                   <label>{intent === "sell" ? "min ¢" : "price ¢"}</label>
-                  <input type="number" min={1} max={99} value={price} onChange={(e) => setPrice(+e.target.value)} />
+                  <input
+                    type="number"
+                    min={1}
+                    max={99}
+                    value={price}
+                    onChange={(e) => setPrice(+e.target.value)}
+                    onWheel={(e) => e.currentTarget.blur()}
+                  />
                 </div>
               )}
               <div className="field">
                 <label>{entryKind === "merge" || entryKind === "split" ? "pairs" : "size"}</label>
-                <input type="number" min={0.000001} step="0.01" value={size} onChange={(e) => setSize(e.target.value)} />
+                <div className="input-clear">
+                  <input
+                    type="number"
+                    min={0.000001}
+                    step="0.01"
+                    value={size}
+                    onChange={(e) => setSize(e.target.value)}
+                    onWheel={(e) => e.currentTarget.blur()}
+                  />
+                  {size !== "" && (
+                    <button type="button" className="clear" aria-label="Clear size" onClick={() => setSize("")}>
+                      ×
+                    </button>
+                  )}
+                </div>
               </div>
               {entryKind === "limit" && (
                 <div className="field">
@@ -2099,6 +2620,22 @@ export function App() {
                 </div>
               )}
             </div>
+            {(entryKind === "limit" || entryKind === "market") && (
+              <div className="row size-presets">
+                {([1, 5, 10, 25, 50] as const).map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => {
+                      const next = (Number(size) || 0) + n;
+                      setSize(String(Number(next.toFixed(6))));
+                    }}
+                  >
+                    +{n}
+                  </button>
+                ))}
+              </div>
+            )}
             {entryKind === "limit" && tif === "GTD" && (
               <div className="row">
                 <div className="field">
@@ -2108,6 +2645,7 @@ export function App() {
                     min={Math.floor(Date.now() / 1000) + 60}
                     value={expiresAt || Math.floor(Date.now() / 1000) + 120}
                     onChange={(e) => setExpiresAt(+e.target.value)}
+                    onWheel={(e) => e.currentTarget.blur()}
                   />
                 </div>
                 <span className="sha">
@@ -2120,19 +2658,74 @@ export function App() {
                 ? entryKind
                 : `${intent === "sell" ? "SELL" : "BUY"} ${side.toUpperCase()}`}
             </button>
-            <div className="sha">
-              {entryKind === "market" && intent === "sell"
-                ? `SELL ${size || 0} ${side.toUpperCase()} into bids`
-                : entryKind === "market"
-                  ? `BUY ${side.toUpperCase()} · up to ${((Number(size) || 0) * 0.99).toFixed(2)} USDC`
-                  : entryKind === "split"
-                    ? `locks ${(Number(size) || 0).toFixed(2)} USDC into YES + NO at 50¢`
-                    : entryKind === "merge"
-                      ? `returns about ${(Number(size) || 0).toFixed(2)} USDC`
-                      : intent === "sell"
-                        ? `SELL ${size || 0} ${side.toUpperCase()} at bids ≥ ${price}¢`
-                        : `cost ≈ ${(((Number(size) || 0) * price) / 100).toFixed(2)} USDC`}
-            </div>
+            {(() => {
+              const n = Number(size) || 0;
+              type Row = { label: string; value: string; valueClass?: string };
+              const rows: Row[] = [];
+              if (entryKind === "market") {
+                const levels = intent === "sell" ? depth.bids : depth.asks;
+                const vwap = approxVwapDecicents(levels, n);
+                const pxCents = vwap != null ? decicentsToCents(vwap) : null;
+                const feeUsdc =
+                  vwap == null ? null : estimateTakerFeeUsdc(n, vwap, cfg?.trading_fee_factor);
+                const notional = pxCents != null && n > 0 ? (n * pxCents) / 100 : null;
+                const feePct =
+                  feeUsdc != null && notional != null && notional > 0 ? (feeUsdc / notional) * 100 : null;
+                if (intent === "buy" && notional != null) {
+                  const profit = n - notional;
+                  const pct = notional > 0 ? (profit / notional) * 100 : 0;
+                  rows.push({ label: "cost", value: `${notional.toFixed(2)} USDC` });
+                  rows.push({
+                    label: "profit",
+                    value: `${profit.toFixed(2)} USDC (${pct.toFixed(0)}%)`,
+                    valueClass: "payout",
+                  });
+                } else if (intent === "sell") {
+                  rows.push({
+                    label: "proceeds",
+                    value: notional != null ? `≈ ${notional.toFixed(2)} USDC` : "into bids",
+                  });
+                }
+                rows.push({
+                  label: "≈ exec",
+                  value: vwap == null ? "—" : `${fmtPriceDecicents(Math.round(vwap))}¢`,
+                });
+                rows.push({ label: "fee %", value: feePct == null ? "—" : `${feePct.toFixed(2)}%` });
+                rows.push({
+                  label: "fee",
+                  value: feeUsdc == null ? "—" : `${fmtUsdNum(feeUsdc)} USDC`,
+                });
+              } else if (entryKind === "split") {
+                rows.push({ label: "locks", value: `${n.toFixed(2)} USDC → YES + NO @ 50¢` });
+              } else if (entryKind === "merge") {
+                rows.push({ label: "returns", value: `≈ ${n.toFixed(2)} USDC` });
+              } else if (intent === "sell") {
+                rows.push({ label: "sell", value: `${n || 0} ${side.toUpperCase()} ≥ ${price}¢` });
+              } else {
+                const cost = (n * price) / 100;
+                const profit = n - cost;
+                const pct = cost > 0 ? (profit / cost) * 100 : 0;
+                rows.push({ label: "cost", value: `${cost.toFixed(2)} USDC` });
+                rows.push({
+                  label: "profit",
+                  value: `${profit.toFixed(2)} USDC (${pct.toFixed(0)}%)`,
+                  valueClass: "payout",
+                });
+              }
+              if (rows.length === 0) return null;
+              return (
+                <table className="place-summary">
+                  <tbody>
+                    {rows.map((r) => (
+                      <tr key={r.label}>
+                        <td className="lbl">{r.label}</td>
+                        <td className={`val${r.valueClass ? ` ${r.valueClass}` : ""}`}>{r.value}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              );
+            })()}
             {err && <div className="err">{err}</div>}
             {msg && <div className="ok">{msg}</div>}
           </div>
@@ -2184,7 +2777,7 @@ export function App() {
                   <tr key={`${t.market_id}-${t.ts_engine}-${t.fill_id}-${t.close_side ?? "buy"}`}>
                     <td className={selling ? "no al" : "yes al"}>{selling ? "SELL" : "BUY"}</td>
                     <td className={side === "Yes" ? "yes al" : "no al"}>{side.toUpperCase()}</td>
-                    <td>{t.yes_price}¢</td>
+                    <td>{fmtPriceDecicents(t.yes_price)}¢</td>
                     <td>{fmtShares(t.size)}</td>
                     <td>{fmtLocalTime(t.ts_engine)}</td>
                     <td className={confirmed ? "al" : "sha al"}>{confirmed ? "confirmed" : "pending"}</td>
@@ -2200,7 +2793,10 @@ export function App() {
         <div className="panel mine">
           <div className="tabs">
             <button className={mineTab === "positions" ? "active" : ""} onClick={() => setMineTab("positions")}>
-              Positions
+              Open positions
+            </button>
+            <button className={mineTab === "closed" ? "active" : ""} onClick={() => setMineTab("closed")}>
+              Closed positions
             </button>
             <button className={mineTab === "orders" ? "active" : ""} onClick={() => setMineTab("orders")}>
               Orders
@@ -2261,6 +2857,7 @@ export function App() {
                           marketId={t.marketId}
                           spotUsd={pxToUsd(spotRaw)}
                           nowSec={nowSec}
+                          priceDp={priceDpFor(cfg, marketAsset(markets.find((m) => m.id === t.marketId) || { id: t.marketId }))}
                         />
                       </td>
                       <td className={pair || settle ? "al" : sell ? "no al" : "yes al"}>{op}</td>
@@ -2345,12 +2942,15 @@ export function App() {
                         marketId={o.market_id}
                         spotUsd={pxToUsd(spotRaw)}
                         nowSec={nowSec}
+                        priceDp={priceDpFor(cfg, marketAsset(markets.find((m) => m.id === o.market_id) || { id: o.market_id }))}
                       />
                     </td>
                     <td className="yes al">BUY</td>
                     <td className={o.side === "Yes" ? "yes" : "no"}>{o.side.toUpperCase()}</td>
                     <td>{o.price}</td>
-                    <td>{fmtShares(o.remaining)}</td>
+                    <td>
+                      {fmtShares(o.remaining, 1)}/{fmtShares(o.size, 1)}
+                    </td>
                     <td>{o.tif || ""}</td>
                     <td>{o.status}</td>
                     <td>
@@ -2365,6 +2965,72 @@ export function App() {
                     </td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          ) : mineTab === "closed" ? (
+            <table>
+              <thead>
+                <tr>
+                  <th className="left">market</th>
+                  <th className="al">op</th>
+                  <th className="al">side</th>
+                  <th>shares</th>
+                  <th>exit</th>
+                  <th>pnl</th>
+                  <th className="al">status</th>
+                  <th className="left">tx</th>
+                  <th>time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const rows = closedFills;
+                  if (rows.length === 0) {
+                    return (
+                      <tr>
+                        <td colSpan={9} className="left">
+                          no closed positions
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return rows.map((t) => {
+                    const pending = t.status === "pending";
+                    const redeemOp = t.op === "settle";
+                    const op = redeemOp ? "REDEEM" : "CLOSE";
+                    const unsettled = pending || t.status === "failed";
+                    const pnl = unsettled ? null : (t.pnl ?? 0) / 1e6;
+                    return (
+                      <tr
+                        key={`closed-${t.txHash}-${t.logIndex}-${t.side}-${t.op}-${t.id}`}
+                        onClick={() => openMarket(t.marketId)}
+                        style={{ cursor: "pointer" }}
+                      >
+                        <td className="left">
+                          <MarketTitlePills
+                            market={markets.find((m) => m.id === t.marketId)}
+                            marketId={t.marketId}
+                            spotUsd={pxToUsd(spotRaw)}
+                            nowSec={nowSec}
+                            priceDp={priceDpFor(cfg, marketAsset(markets.find((m) => m.id === t.marketId) || { id: t.marketId }))}
+                          />
+                        </td>
+                        <td className="al">{op}</td>
+                        <td className={t.side === "Yes" ? "yes al" : "no al"}>{t.side.toUpperCase()}</td>
+                        <td>{fmtShares(t.shares)}</td>
+                        <td>{redeemOp ? "$1" : `${t.price}¢`}</td>
+                        <td className={pnl == null ? "" : pnl < 0 ? "no" : pnl > 0 ? "yes" : ""}>
+                          {pnl == null ? "—" : fmtSignedUsdNum(pnl)}
+                        </td>
+                        <td className={pending ? "sha al" : t.status === "failed" ? "no al" : "al"}>
+                          {t.status === "pending" ? "pending" : t.status === "failed" ? "failed" : "confirmed"}
+                        </td>
+                        <td className="left">{shortTx(t.txHash)}</td>
+                        <td>{fmtLocalTime(t.ts)}</td>
+                      </tr>
+                    );
+                  });
+                })()}
               </tbody>
             </table>
           ) : (
@@ -2391,7 +3057,7 @@ export function App() {
                     return (
                       <tr>
                         <td colSpan={9} className="left">
-                          no positions
+                          no open positions
                         </td>
                       </tr>
                     );
@@ -2423,6 +3089,7 @@ export function App() {
                             marketId={p.marketId}
                             spotUsd={pxToUsd(spotRaw)}
                             nowSec={nowSec}
+                            priceDp={priceDpFor(cfg, marketAsset(mkt || { id: p.marketId }))}
                           />
                         </td>
                         <td className={p.side === "Yes" ? "yes al" : "no al"}>{p.side.toUpperCase()}</td>
@@ -2491,11 +3158,12 @@ function userBookLevels(orders: LedgerOrder[], market: string, view: Side): { bi
   const asks = new Map<number, number>();
   for (const o of orders) {
     if (o.market_id !== market) continue;
-    if (o.status !== "Resting" && o.status !== "Partial" && o.status !== "Accepted") continue;
+    if (!isOpenOrderStatus(o.status)) continue;
     const rem = Number(o.remaining);
     if (!(rem > 0)) continue;
     const bucket = o.side === view ? bids : asks;
-    const px = o.side === view ? o.price : 100 - o.price;
+    const px = Number(o.side === view ? o.price : 1000 - o.price);
+    if (!Number.isFinite(px)) continue;
     bucket.set(px, (bucket.get(px) || 0) + rem);
   }
   return { bids, asks };
@@ -2537,7 +3205,7 @@ function BookLadder({
   const bestBid = bids[0]?.[0];
   const spread =
     bestAsk != null && bestBid != null && Number.isFinite(bestAsk) && Number.isFinite(bestBid)
-      ? bestAsk - bestBid
+      ? (bestAsk - bestBid) / 10
       : null;
 
   // Keep best asks pinned to the spread when the ask side updates.
@@ -2552,21 +3220,21 @@ function BookLadder({
     sideTotal: number,
     mine?: Map<number, number>
   ) {
-    const yours = mine?.get(r.p) || 0;
+    const yours = mine?.get(Number(r.p)) || 0;
     const depthPct = sideTotal > 0 ? Math.min(100, (r.cum / sideTotal) * 100) : 0;
     return (
       <tr
         key={`${kind}-${r.p}`}
         className={yours > 0 ? `${kind} mine` : kind}
         style={{ ["--depth" as string]: `${depthPct}%` }}
-        title={yours > 0 ? "your order" : undefined}
+        title={yours > 0 ? `your order · ${fmtShares(yours, 1)}` : undefined}
         onClick={() => {
-          if (r.p) onPick(r.p);
+          if (r.p) onPick(decicentsToCents(r.p));
         }}
       >
         <td className={kind === "bid" ? "yes" : "no"}>
-          {r.p}
-          {yours > 0 ? " ●" : ""}
+          {yours > 0 ? "● " : ""}
+          {fmtPriceDecicents(r.p)}
         </td>
         <td>{fmtShares(r.sz, 1)}</td>
         <td>{fmtUsd(r.level)}</td>
@@ -2671,8 +3339,8 @@ function ChartCrosshair({
   return (
     <>
       <svg className="crosshair" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
-        <line x1={vx} x2={vx} y1={0} y2={h} stroke="#8b95a8" strokeWidth="1" vectorEffect="non-scaling-stroke" />
-        <line x1={0} x2={w} y1={vy} y2={vy} stroke="#8b95a8" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+        <line x1={vx} x2={vx} y1={0} y2={h} stroke="#8a969e" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+        <line x1={0} x2={w} y1={vy} y2={vy} stroke="#8a969e" strokeWidth="1" vectorEffect="non-scaling-stroke" />
       </svg>
       <div
         className={`cross-readout${flip ? " flip" : ""}`}
@@ -2730,8 +3398,9 @@ const MidChart = memo(function MidChart({
       : "";
   const lastPx = last?.p ?? null;
   const yLast = lastPx == null ? null : y(lastPx);
-  const yHi = y(hi);
-  const yLo = y(lo);
+  const priceSteps: number[] = [];
+  for (let p = lo; p <= hi + 1e-9; p += 10) priceSteps.push(p);
+  const timeTicks = chartTimeTicks(start, end);
   const plotRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ vx: number; vy: number } | null>(null);
   const hoverLabel = hover
@@ -2747,7 +3416,37 @@ const MidChart = memo(function MidChart({
           onMouseLeave={() => setHover(null)}
         >
         <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
-          <line x1={pad} x2={w - pad} y1={h - pad} y2={h - pad} stroke="#2a3140" strokeWidth="1" />
+          {drawn.length > 0 &&
+            priceSteps.map((p) => {
+              const yy = y(p);
+              return (
+                <line
+                  key={`g${p}`}
+                  x1={0}
+                  x2={w}
+                  y1={yy}
+                  y2={yy}
+                  stroke="#3a4450"
+                  strokeWidth="1"
+                  strokeDasharray="2 4"
+                  vectorEffect="non-scaling-stroke"
+                  opacity="0.45"
+                />
+              );
+            })}
+          {yLast != null && (
+            <line
+              x1={0}
+              x2={w}
+              y1={yLast}
+              y2={yLast}
+              stroke={color}
+              strokeWidth="1"
+              strokeDasharray="3 3"
+              vectorEffect="non-scaling-stroke"
+              opacity="0.7"
+            />
+          )}
           {d && (
             <path
               d={d}
@@ -2764,16 +3463,12 @@ const MidChart = memo(function MidChart({
         {hover && <ChartCrosshair w={w} h={h} vx={hover.vx} vy={hover.vy} label={hoverLabel} />}
         </div>
         <div className="chart-yaxis">
-          {drawn.length > 0 && (
-            <>
-              <div className="tick" style={{ top: `${(yHi / h) * 100}%` }}>
-                {fmtCents(hi)}¢
+          {drawn.length > 0 &&
+            priceSteps.map((p) => (
+              <div key={`y${p}`} className="tick" style={{ top: `${(y(p) / h) * 100}%` }}>
+                {fmtCents(p)}¢
               </div>
-              <div className="tick" style={{ top: `${(yLo / h) * 100}%` }}>
-                {fmtCents(lo)}¢
-              </div>
-            </>
-          )}
+            ))}
           {yLast != null && lastPx != null && (
             <div className="tick mid" style={{ top: `${(yLast / h) * 100}%`, color }}>
               <span className="lbl" style={{ color }}>mid</span>
@@ -2783,9 +3478,26 @@ const MidChart = memo(function MidChart({
         </div>
       </div>
       <div className="chart-axis">
-        <span>{fmtChartTick(start, spanT)}</span>
-        <span>{drawn.length ? "" : "waiting for book mid…"}</span>
-        <span>{fmtChartTick(end, spanT)}</span>
+        <div className="chart-xaxis">
+          {drawn.length === 0 ? (
+            <span className="waiting">waiting for book mid…</span>
+          ) : (
+            timeTicks.map((t, i) => {
+              const left = ((t - start) / spanT) * 100;
+              const edge = i === 0 ? "start" : i === timeTicks.length - 1 ? "end" : "";
+              return (
+                <span
+                  key={`t${t}-${i}`}
+                  className={`xtick${edge ? ` ${edge}` : ""}`}
+                  style={{ left: `${left}%` }}
+                >
+                  {fmtChartTick(t, spanT)}
+                </span>
+              );
+            })
+          )}
+        </div>
+        <div className="chart-axis-spacer" aria-hidden />
       </div>
     </div>
   );
