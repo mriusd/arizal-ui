@@ -1,5 +1,5 @@
 import type { SignedOrder } from "./api/types";
-import { keccak256, parseUnits, toBytes } from "viem";
+import { getAddress, keccak256, parseUnits, toBytes, type Address } from "viem";
 
 /** Human-readable EIP-712 types — MetaMask shows these strings in the signature prompt. */
 export const orderTypes = {
@@ -14,6 +14,7 @@ export const orderTypes = {
     { name: "nonce", type: "uint256" },
     { name: "salt", type: "uint256" },
     { name: "expiresAt", type: "uint256" },
+    { name: "gasFee", type: "uint256" },
   ],
 } as const;
 
@@ -25,34 +26,6 @@ export const cancelTypes = {
     { name: "nonce", type: "uint256" },
   ],
 } as const;
-
-export const mergeTypes = {
-  Merge: [
-    { name: "trader", type: "address" },
-    { name: "marketId", type: "string" },
-    { name: "shares", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-  ],
-} as const;
-
-export const splitTypes = {
-  Split: [
-    { name: "trader", type: "address" },
-    { name: "marketId", type: "string" },
-    { name: "shares", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-  ],
-} as const;
-
-export const faucetTypes = {
-  Faucet: [
-    { name: "trader", type: "address" },
-    { name: "amount", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-  ],
-} as const;
-
-export const FAUCET_USDC = 1000n * 1_000_000n;
 
 export const cancelAllTypes = {
   CancelAll: [
@@ -86,6 +59,7 @@ export function orderMessage(o: SignedOrder) {
     nonce: BigInt(o.nonce),
     salt: BigInt(o.salt),
     expiresAt: BigInt(o.expires_at),
+    gasFee: BigInt(o.gas_fee ?? 0),
   };
 }
 
@@ -96,4 +70,24 @@ export function domain(chainId: number, verifyingContract: `0x${string}`) {
     chainId,
     verifyingContract,
   };
+}
+
+/** Human-readable personal_sign body — must match clearbook-crypto `set_nickname_message`. */
+export function setNicknameMessage(trader: Address, nickname: string, nonce: number, chainId: number): string {
+  return `Arizal Set Nickname\n\nWallet: ${getAddress(trader)}\nNickname: ${nickname}\nNonce: ${nonce}\nChain ID: ${chainId}`;
+}
+
+/** Human-readable personal_sign body — must match clearbook-crypto `set_email_message`. */
+export function setEmailMessage(trader: Address, email: string, nonce: number, chainId: number): string {
+  return `Arizal Set Email\n\nWallet: ${getAddress(trader)}\nEmail: ${email}\nNonce: ${nonce}\nChain ID: ${chainId}`;
+}
+
+/** Human-readable personal_sign body — must match clearbook-crypto `resend_email_code_message`. */
+export function resendEmailCodeMessage(
+  trader: Address,
+  email: string,
+  nonce: number,
+  chainId: number
+): string {
+  return `Arizal Resend Email Code\n\nWallet: ${getAddress(trader)}\nEmail: ${email}\nNonce: ${nonce}\nChain ID: ${chainId}`;
 }

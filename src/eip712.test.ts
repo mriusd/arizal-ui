@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CANCEL_ALL_MARKETS, cancelAllMarketId, marketIdHash, orderMessage } from "./eip712";
 import type { SignedOrder } from "./api/types";
-import { localChain } from "./wagmi";
+import { localChain } from "./chain";
 
 describe("order payload", () => {
   it("hashes market id as keccak of utf8 bytes", () => {
@@ -20,6 +20,7 @@ describe("order payload", () => {
       nonce: 1,
       salt: 2,
       expires_at: 0,
+      gas_fee: 10_000,
       chain_id: 31337,
       verifying_contract: "0x1111111111111111111111111111111111111111",
     };
@@ -30,6 +31,7 @@ describe("order payload", () => {
     expect(m.orderType).toBe("Limit");
     expect(m.tif).toBe("GTC");
     expect(m.marketId).toBe(o.market_id);
+    expect(m.gasFee).toBe(10_000n);
   });
 
   it("CancelAll marketId is the market string or empty for all", () => {
@@ -41,6 +43,6 @@ describe("order payload", () => {
   it("local chain is Hardhat 31337 not mainnet", () => {
     expect(localChain.id).toBe(31337);
     expect(localChain.id).not.toBe(1);
-    expect(localChain.rpcUrls.default.http[0]).toContain("127.0.0.1:8545");
+    expect(localChain.rpcUrls.default.http[0]).toMatch(/127\.0\.0\.1:8545|\/rpc$/);
   });
 });

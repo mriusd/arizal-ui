@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="docs.css" />
+    <title>Introduction | Docs | Arizal Exchange</title>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="https://arizal.xyz/">
+        <img src="logo.svg" alt="" width="20" height="20" />
+        arizal<span>.xyz</span>
+      </a>
+      <span class="header-title">Documentation</span>
+      <span aria-hidden="true"></span>
+    </header>
+    <div class="docs-shell">
+      <nav class="toc" aria-label="Docs sections">
+        <a href="/" class="active">Introduction</a>
+        <a href="/exchange">Exchange logic</a>
+        <a href="/contract">Contract</a>
+        <a href="/api">API</a>
+      </nav>
+      <main>
+        <h1>Introduction</h1>
+        <p class="lead">Arizal Exchange provides crypto prediction markets — timed Yes/No markets on crypto prices, settled in USDC on a single immutable exchange contract.</p>
+
+        <h3>Market kinds</h3>
+        <p>Every market is one of three kinds:</p>
+        <ul>
+          <li><strong>Hit</strong> — Yes if spot touches the barrier before expiry (and on related expiry rules).</li>
+          <li><strong>Above</strong> — Yes if spot is at or above the barrier at expiry.</li>
+          <li><strong>Between</strong> — Yes if spot finishes inside a low–high barrier band at expiry.</li>
+        </ul>
+        <p>Timeframes start at <strong>daily</strong>, then weekly, monthly, and quarterly. Arizal does not offer, and does not plan to offer, short-horizon up/down markets (for example 5m or 15m). The shortest market is daily.</p>
+
+        <h3>Philosophy</h3>
+        <ul>
+          <li><strong>One immutable contract.</strong> A single-file smart contract, not upgradeable. What you see on chain is what runs; a change means a new deploy at a new address.</li>
+          <li><strong>Simple enough to audit.</strong> Very small surface area so anyone — and any AI — can read it. Source is open on Etherscan.</li>
+          <li><strong>Minimal UI.</strong> Few libraries, most application code written in-house, no unnecessary layers or frameworks for their own sake.</li>
+          <li><strong>Home of crypto prediction markets.</strong> The product aim is to be the durable place people come for crypto-priced Yes/No markets — not a casino of minute-scale flips.</li>
+          <li><strong>Independent and experienced.</strong> No VC investment. Bootstrapped by the dev team, with more than eight years building decentralized applications and multiple shipped decentralized projects.</li>
+          <li><strong>AI for toil, humans for risk.</strong> AI helps with cumbersome work; core logic and contract security are written and audited by hand so exploits stay out of reach. Simplicity of the contract is a deliberate aid. That posture comes straight from EtherDelta — the original decentralized exchange — which remains secure to this day.</li>
+        </ul>
+
+        <nav class="docs-pager" aria-label="Page">
+          <span class="muted">&lt;&lt; —</span>
+          <span class="sep">|</span>
+          <a href="/exchange">&gt;&gt; Exchange logic</a>
+        </nav>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="docs.css" />
+    <title>API | Docs | Arizal Exchange</title>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="https://arizal.xyz/">
+        <img src="logo.svg" alt="" width="20" height="20" />
+        arizal<span>.xyz</span>
+      </a>
+      <span class="header-title">Documentation</span>
+      <span aria-hidden="true"></span>
+    </header>
+    <div class="docs-shell">
+      <nav class="toc" aria-label="Docs sections">
+        <a href="/">Introduction</a>
+        <a href="/exchange">Exchange logic</a>
+        <a href="/contract">Contract</a>
+        <a href="/api" class="active">API</a>
+      </nav>
+      <main>
+        <h1>API</h1>
+        <p class="lead">
+          Base URL <code>http://127.0.0.1:8080/v1</code> (local). JSON request/response unless noted.
+          Machine-readable schema: <a href="http://127.0.0.1:8080/v1/openapi.yaml"><code>GET /v1/openapi.yaml</code></a>.
+          Paths below are relative to <code>/v1</code>.
+          HTTP is rate-limited per client IP (default <strong>300</strong> requests / 60s;
+          <code>http_rate_limit_per_min</code> in <code>clearbook.toml</code>, <code>0</code> = off).
+          Over limit → <code>429</code> <code>rate limited; retry in Ns</code> + <code>Retry-After</code>.
+          IP from first <code>X-Forwarded-For</code>, else <code>X-Real-IP</code>, else TCP peer.
+          <code>GET /health</code> is not counted; WebSocket frames after upgrade are not counted.
+        </p>
+
+        <h2>Meta</h2>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/health</code></h3>
+        <p class="ep-meta">Liveness probe.</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>ok</pre>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/version</code></h3>
+        <p class="ep-meta">Node / engine identity.</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "git_sha": "dev",
+  "version": "0.1.0"
+}</pre>
+
+        <h3 id="get-config" class="endpoint"><span class="method get">GET</span> <code class="path">/config</code></h3>
+        <p class="ep-meta">Chain addresses, EIP-712 domain, fees, TIFs.</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "chain_id": 31337,
+  "exchange": "0x…",
+  "usdc": "0x…",
+  "chainlink_btc_usd": "0x…",
+  "size_decimals": 6,
+  "size_unit": 1000000,
+  "eip712": { "name": "Arizal", "version": "1" },
+  "gtd_min_secs": 60,
+  "tif": ["GTC", "GTD", "FOK", "FAK"],
+  "trading_fee_factor": "70000000000000000",
+  "gas_fee": 50000,
+  "assets": { "btc": { "price_decimals": 0 } }
+}</pre>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/openapi.yaml</code></h3>
+        <p class="ep-meta">OpenAPI 3 YAML (content-type <code>application/yaml</code>).</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>openapi: 3.0.3
+info:
+  title: Clearbook API
+  version: "1"
+# …</pre>
+
+        <h2>Markets</h2>
+
+        <h3 id="get-markets" class="endpoint"><span class="method get">GET</span> <code class="path">/markets</code></h3>
+        <p class="ep-meta">All markets from memory (not PostgreSQL).</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "id": "btc-hit-80000-up-daily-…",
+    "kind": "Hit",
+    "status": "Open",
+    "barrier": "80000",
+    "expires_at": 1735689600,
+    "best_yes_bid": 450,
+    "best_yes_ask": 550,
+    "last_yes_price": 500
+  }
+]</pre>
+
+        <h3 id="get-market" class="endpoint"><span class="method get">GET</span> <code class="path">/markets/:id</code></h3>
+        <p class="ep-meta">One market.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Market id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "id": "btc-hit-80000-up-daily-…",
+  "kind": "Hit",
+  "status": "Open",
+  "barrier": "80000",
+  "expires_at": 1735689600,
+  "last_yes_price": 500
+}</pre>
+
+        <h3 id="get-book" class="endpoint"><span class="method get">GET</span> <code class="path">/markets/:id/book</code></h3>
+        <p class="ep-meta">Aggregated Yes / No depth.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Market id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "market_id": "btc-hit-80000-up-daily-…",
+  "status": "Open",
+  "bids_yes": [[450, "10.0"], [400, "5.0"]],
+  "bids_no": [[500, "8.0"]],
+  "seq": 42
+}</pre>
+
+        <h3 id="get-tape" class="endpoint"><span class="method get">GET</span> <code class="path">/markets/:id/tape</code></h3>
+        <p class="ep-meta">Engine log for that market.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Market id</td></tr>
+            <tr><td><code>cursor</code></td><td>query</td><td>no</td><td>Return events with <code>seq</code> &gt; cursor</td></tr>
+            <tr><td><code>limit</code></td><td>query</td><td>no</td><td>Max events (default 100)</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  { "seq": 10, "ts": 1735689000, "kind": "Accepted", "order_id": 1, "market_id": "…" }
+]</pre>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/markets/:id/chart</code></h3>
+        <p class="ep-meta">Yes book mid history (¢), ~1 sample/min; <code>current</code> is live mid.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Market id</td></tr>
+            <tr><td><code>tf</code></td><td>query</td><td>no</td><td><code>5m</code>, <code>1h</code>, <code>1d</code>, or <code>30d</code></td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "market_id": "btc-hit-80000-up-daily-…",
+  "series": "…",
+  "start_ts": 1735600000,
+  "end_ts": 1735689600,
+  "now_ts": 1735689000,
+  "status": "Open",
+  "current": "52.5",
+  "source": "BOOK_MID",
+  "points": [{ "ts": 1735688400, "price": "51.0" }]
+}</pre>
+
+        <h3 id="get-holders" class="endpoint"><span class="method get">GET</span> <code class="path">/markets/:id/holders</code></h3>
+        <p class="ep-meta">Yes / No holders from the positions mirror.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Market id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "market_id": "btc-hit-80000-up-daily-…",
+  "yes": [{ "trader": "0x…", "shares": "10.0", "usdc_staked": 5000000 }],
+  "no": [{ "trader": "0x…", "shares": "5.0", "usdc_staked": 2500000 }]
+}</pre>
+
+        <h3 id="get-trades" class="endpoint"><span class="method get">GET</span> <code class="path">/trades</code></h3>
+        <p class="ep-meta">Recent in-memory fills (not PostgreSQL).</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>market</code></td><td>query</td><td>no</td><td>Filter by market id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "fill_id": 12,
+    "market_id": "btc-hit-80000-up-daily-…",
+    "yes_price": 550,
+    "size": "2.0",
+    "taker_side": "Yes",
+    "confirmed": false
+  }
+]</pre>
+
+        <h3 id="get-price" class="endpoint"><span class="method get">GET</span> <code class="path">/price</code></h3>
+        <p class="ep-meta">Latest spot / TWAP and open-market barrier.</p>
+        <p class="ep-label">Parameters</p>
+        <p>None.</p>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "price": "97500.12",
+  "ts": 1735689000,
+  "barrier": "97000",
+  "source": "binance"
+}</pre>
+
+        <h2>Orders</h2>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/orders/:id</code></h3>
+        <p class="ep-meta">One order’s status.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Order id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "id": 7,
+  "status": "Resting",
+  "remaining": "3.0",
+  "order": { "trader": "0x…", "market_id": "…", "side": "Yes", "price": 600, "size": 5 }
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/orders</code></h3>
+        <p class="ep-meta">Place a signed EIP-712 <code>Order</code>. Optional <code>agent_auth</code> for 1-click session key.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "order": {
+    "trader": "0x…",
+    "market_id": "btc-hit-80000-up-daily-…",
+    "side": "Yes",
+    "price": 600,
+    "size": 2000000,
+    "order_type": "Limit",
+    "tif": "GTC",
+    "nonce": 1,
+    "salt": 99,
+    "expires_at": 0,
+    "gas_fee": 50000,
+    "chain_id": 31337,
+    "verifying_contract": "0x…"
+  },
+  "signature": "0x…",
+  "agent_auth": null,
+  "close": false
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "order_id": 7,
+  "fills": [12],
+  "status": "Resting",
+  "remaining": 1000000,
+  "reason": null
+}</pre>
+
+        <h3 class="endpoint"><span class="method delete">DELETE</span> <code class="path">/orders/:id</code></h3>
+        <p class="ep-meta">Cancel one order (EIP-712 <code>Cancel</code>). Signer may be trader or session agent.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>path</td><td>yes</td><td>Order id</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "cancel": {
+    "order_id": 7,
+    "trader": "0x…",
+    "market_id": "btc-hit-80000-up-daily-…",
+    "nonce": 2
+  },
+  "signature": "0x…",
+  "agent_auth": null
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "order_id": 7,
+  "status": "Cancelled"
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/orders/replace</code></h3>
+        <p class="ep-meta">Atomic cancel + place. Same market/side/remaining size; new price required.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "cancel": {
+    "order_id": 7,
+    "trader": "0x…",
+    "market_id": "…",
+    "nonce": 3,
+    "signature": "0x…"
+  },
+  "order": { "…": "SignedOrder fields" },
+  "signature": "0x…",
+  "agent_auth": null
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "cancelled": 7,
+  "order_id": 8,
+  "fills": [],
+  "status": "Resting",
+  "remaining": 2000000
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/orders/cancel-all</code></h3>
+        <p class="ep-meta">EIP-712 <code>CancelAll</code>. Omit <code>market_id</code> (or empty) to cancel every open order for the trader.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "market_id": null,
+  "nonce": 10,
+  "signature": "0x…",
+  "agent_auth": null
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "count": 3,
+  "errors": []
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/batch</code></h3>
+        <p class="ep-meta">FIFO cancels and places (<code>ops</code>, or <code>cancels</code> then <code>orders</code>). Cap ~64 ops.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "ops": [
+    { "cancel": { "order_id": 1, "trader": "0x…", "market_id": "…", "nonce": 1, "signature": "0x…" } },
+    { "order": { "…": "SignedOrder" }, "signature": "0x…" }
+  ]
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "results": [
+    { "ok": true, "order_id": 1 },
+    { "order_id": 9, "fills": [], "status": "Resting", "remaining": 1000000 }
+  ]
+}</pre>
+
+        <h2>Account</h2>
+
+        <h3 id="get-account" class="endpoint"><span class="method get">GET</span> <code class="path">/account</code></h3>
+        <p class="ep-meta">Balances, profile, open orders. Optional market for Yes/No share snapshot.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Wallet address</td></tr>
+            <tr><td><code>market</code></td><td>query</td><td>no</td><td>Market id for share fields</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "trader": "0x…",
+  "collateral": 100000000,
+  "reserved": 5000000,
+  "available": 95000000,
+  "volume_30d": 2500000,
+  "taker_coeff": 0.07,
+  "nickname": "alice",
+  "email": "a@example.com",
+  "email_verified": true,
+  "referrer": "0x…",
+  "referred_taker_volume": 0,
+  "referred_maker_volume": 0,
+  "referred_taker_fees": 0,
+  "yes_shares": "0",
+  "no_shares": "0",
+  "eth_wei": "10000000000000000000",
+  "usdc_unit": 1000000,
+  "open_orders": []
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/account/nickname</code></h3>
+        <p class="ep-meta">Set nickname via EIP-191 personal_sign of a human-readable <code>Arizal Set Nickname</code> message.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "nickname": "alice",
+  "nonce": 1735689000123,
+  "signature": "0x…"
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "trader": "0x…",
+  "nickname": "alice"
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/account/email</code></h3>
+        <p class="ep-meta">Set email (unverified) via personal_sign <code>Arizal Set Email</code>. With Resend configured, emails the code and omits <code>verification_code</code>.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "email": "a@example.com",
+  "nonce": 1735689000456,
+  "signature": "0x…"
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "trader": "0x…",
+  "email": "a@example.com",
+  "email_verified": false,
+  "email_sent": true,
+  "code_expires_at": 1735689900,
+  "resend_after": 1735689060
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/account/email/resend</code></h3>
+        <p class="ep-meta">New code for pending email. Signed <code>Arizal Resend Email Code</code>. Rate limited to 1 / 60s per trader (<code>429</code>).</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "nonce": 1735689060123,
+  "signature": "0x…"
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "trader": "0x…",
+  "email": "a@example.com",
+  "email_verified": false,
+  "email_sent": true,
+  "code_expires_at": 1735689960,
+  "resend_after": 1735689120
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/account/email/verify</code></h3>
+        <p class="ep-meta">Mark email verified with the 6-digit code.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "code": "123456"
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "trader": "0x…",
+  "email": "a@example.com",
+  "email_verified": true
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/account/referrer</code></h3>
+        <p class="ep-meta">Set referrer once if unset. First write wins.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0xAlice…",
+  "referrer": "0xBob…"
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "trader": "0xAlice…",
+  "referrer": "0xbob…",
+  "newly_set": true
+}</pre>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/account/referrals</code></h3>
+        <p class="ep-meta">Wallets that set this address as referrer, with per-wallet and total weighted volume / taker fees.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Referrer wallet</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "trader": "0xBob…",
+  "referrals": [
+    {
+      "trader": "0xalice…",
+      "taker_volume": 2400000,
+      "maker_volume": 1000000,
+      "taker_fees": 42000
+    }
+  ],
+  "referred_taker_volume": 2400000,
+  "referred_maker_volume": 1000000,
+  "referred_taker_fees": 42000
+}</pre>
+
+        <h2>Ledger</h2>
+
+        <h3 id="get-ledger-orders" class="endpoint"><span class="method get">GET</span> <code class="path">/ledger/orders</code></h3>
+        <p class="ep-meta">Open orders for a wallet.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Wallet address</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "id": 7,
+    "market_id": "…",
+    "side": "Yes",
+    "price": 600,
+    "size": "5.0",
+    "remaining": "3.0",
+    "status": "Resting",
+    "tif": "GTC",
+    "expires_at": 0
+  }
+]</pre>
+
+        <h3 id="get-ledger-history" class="endpoint"><span class="method get">GET</span> <code class="path">/ledger/history</code></h3>
+        <p class="ep-meta">Wallet fills / split / merge / redeem newest first.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Wallet address</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "fill_id": 12,
+    "market_id": "…",
+    "side": "Yes",
+    "op": "trade",
+    "price": 550,
+    "size": "2.0",
+    "fee": 15000,
+    "status": "confirmed",
+    "ts": 1735689000
+  }
+]</pre>
+
+        <h3 id="get-ledger-positions" class="endpoint"><span class="method get">GET</span> <code class="path">/ledger/positions</code></h3>
+        <p class="ep-meta">Holdings (active markets + unredeemed winning resolved sides).</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Wallet address</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "market_id": "…",
+    "side": "Yes",
+    "shares": "10.0",
+    "usdc_staked": 5500000
+  }
+]</pre>
+
+        <h3 class="endpoint"><span class="method get">GET</span> <code class="path">/ledger/funds</code></h3>
+        <p class="ep-meta">Deposits and withdrawals.</p>
+        <p class="ep-label">Parameters</p>
+        <table>
+          <thead><tr><th>Name</th><th>In</th><th>Required</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>trader</code></td><td>query</td><td>yes</td><td>Wallet address</td></tr>
+          </tbody>
+        </table>
+        <p class="ep-label">Response</p>
+        <pre>[
+  {
+    "op": "deposit",
+    "amount": "100000000",
+    "tx_hash": "0x…",
+    "status": "confirmed",
+    "ts": 1735688000
+  }
+]</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/ledger/pending</code></h3>
+        <p class="ep-meta">Note a wallet tx as pending until the chain log is indexed.</p>
+        <p class="ep-label">Body</p>
+        <pre>{
+  "trader": "0x…",
+  "op": "deposit",
+  "amount": "100000000",
+  "tx_hash": "0x…",
+  "market_id": null
+}</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "ok": true,
+  "status": "pending"
+}</pre>
+
+        <h2>Faucet (local / Hardhat)</h2>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/faucet</code></h3>
+        <p class="ep-meta">10 ETH + 1,000 mock USDC to the wallet (not the exchange).</p>
+        <p class="ep-label">Body</p>
+        <pre>{ "address": "0x…" }</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "address": "0x…",
+  "eth_tx_hash": "0x…",
+  "usdc_tx_hash": "0x…",
+  "amount_eth": "10",
+  "amount_usdc": "1000000000"
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/faucet/gas</code></h3>
+        <p class="ep-meta">10 ETH only.</p>
+        <p class="ep-label">Body</p>
+        <pre>{ "address": "0x…" }</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "address": "0x…",
+  "tx_hash": "0x…",
+  "amount_eth": "10"
+}</pre>
+
+        <h3 class="endpoint"><span class="method post">POST</span> <code class="path">/faucet/usdc</code></h3>
+        <p class="ep-meta">1,000 mock USDC only.</p>
+        <p class="ep-label">Body</p>
+        <pre>{ "address": "0x…" }</pre>
+        <p class="ep-label">Response</p>
+        <pre>{
+  "address": "0x…",
+  "tx_hash": "0x…",
+  "amount": "1000000000"
+}</pre>
+
+        <h2>WebSocket</h2>
+
+        <h3 class="endpoint"><span class="method ws">WS</span> <code class="path">/ws</code></h3>
+        <p class="ep-meta">
+          Connect to <code>ws://127.0.0.1:8080/v1/ws</code> (or <code>wss://</code> in production).
+          Text frames are JSON. After connect the node fans out <strong>every</strong> broadcast to
+          all sockets — subscribe only requests an immediate snapshot for that channel; filter by
+          <code>market</code> / <code>trader</code> on the client.
+        </p>
+
+        <p class="ep-label">Client → server</p>
+        <pre>{
+  "op": "subscribe",
+  "channel": "book",
+  "market": "btc-hit-80000-up-daily-…"
+}</pre>
+        <p>
+          Only <code>op: "subscribe"</code> is handled. <code>market</code> is required for
+          <code>book</code>, <code>tape</code>, <code>trades</code>, and <code>resolved</code>.
+          Other frames are ignored.
+        </p>
+
+        <p class="ep-label">Subscribe channels</p>
+        <table>
+          <thead><tr><th>Channel</th><th><code>market</code></th><th>Immediate reply</th></tr></thead>
+          <tbody>
+            <tr><td><code>config</code></td><td>no</td><td><code>config</code> (same as on-connect)</td></tr>
+            <tr><td><code>markets</code></td><td>no</td><td><code>markets</code></td></tr>
+            <tr><td><code>price</code></td><td>no</td><td><code>price</code></td></tr>
+            <tr><td><code>book</code></td><td>yes</td><td><code>book</code> (+ <code>quote</code>)</td></tr>
+            <tr><td><code>tape</code></td><td>yes</td><td><code>tape_snapshot</code></td></tr>
+            <tr><td><code>trades</code></td><td>yes</td><td><code>trades_snapshot</code></td></tr>
+            <tr><td><code>resolved</code></td><td>yes</td><td><code>resolved</code></td></tr>
+          </tbody>
+        </table>
+
+        <p class="ep-label">Push-only channels (no subscribe)</p>
+        <p>
+          <code>market</code>, <code>last_yes</code>, <code>quote</code>, <code>account</code>,
+          <code>ledger</code>, <code>ledger_delta</code>, <code>holders</code>, <code>orders</code>,
+          live <code>tape</code> / <code>trades</code> / <code>book</code> / <code>config</code> refreshes.
+        </p>
+
+        <h4><code>config</code></h4>
+        <p class="ep-meta">
+          Sent on connect, on <code>subscribe config</code>, and about once a minute when
+          <code>gas_fee</code> refreshes. Subset of <a href="#get-config"><code>GET /config</code></a>
+          (<code>gas_fee</code>, <code>trading_fee_factor</code>, <code>chain_id</code>, <code>exchange</code> only).
+        </p>
+        <pre>{
+  "channel": "config",
+  "gas_fee": 50000,
+  "trading_fee_factor": "70000000000000000",
+  "chain_id": 31337,
+  "exchange": "0x…"
+}</pre>
+
+        <h4><code>markets</code></h4>
+        <p class="ep-meta">
+          On subscribe and when a market locks or resolves.
+          <code>markets</code> is the same array as <a href="#get-markets"><code>GET /markets</code></a>.
+        </p>
+        <pre>{
+  "channel": "markets",
+  "markets": [ /* same objects as GET /markets */ ]
+}</pre>
+
+        <h4><code>market</code></h4>
+        <p class="ep-meta">
+          When a market opens (push only). <code>market</code> matches
+          <a href="#get-market"><code>GET /markets/:id</code></a> / one element of
+          <a href="#get-markets"><code>GET /markets</code></a>.
+        </p>
+        <pre>{
+  "channel": "market",
+  "op": "opened",
+  "market": { /* Market */ }
+}</pre>
+
+        <h4><code>resolved</code></h4>
+        <p class="ep-meta">
+          On subscribe with <code>market</code>, and again when any peer for that strike/expiry resolves.
+          <code>markets</code> are resolved <code>Market</code> rows (same shape as
+          <a href="#get-markets"><code>GET /markets</code></a>) sharing kind + barrier (+ high) + expiry
+          with the subscribed id (hit up and down both included; newest resolve first).
+        </p>
+        <pre>{
+  "channel": "resolved",
+  "market": "btc-hit-80000-up-daily-…",
+  "strike": "…",
+  "expires_at": 1735689600,
+  "markets": [ /* Market[] */ ]
+}</pre>
+
+        <h4><code>price</code></h4>
+        <p class="ep-meta">
+          On subscribe and on each spot tick (~1s). Same core fields as
+          <a href="#get-price"><code>GET /price</code></a>, plus <code>spot</code>
+          (HTTP has <code>price</code> / <code>ts</code> / <code>barrier</code> / <code>source</code> only).
+        </p>
+        <pre>{
+  "channel": "price",
+  "price": "97500.12",
+  "spot": "97480.00",
+  "barrier": "97000",
+  "ts": 1735689000,
+  "source": "binance"
+}</pre>
+
+        <h4><code>book</code> / <code>quote</code></h4>
+        <p class="ep-meta">
+          Subscribe <code>book</code> (with <code>market</code>) publishes both immediately.
+          Further book/quote pushes after place/cancel/fill, rate-limited to about once per market per 80ms
+          (cancel-all forces an immediate book).
+          <code>bids_yes</code> / <code>bids_no</code> match
+          <a href="#get-book"><code>GET /markets/:id/book</code></a>
+          (WS uses <code>market</code> instead of <code>market_id</code>, adds <code>book_hash</code>, omits <code>status</code>).
+        </p>
+        <pre>{
+  "channel": "book",
+  "market": "btc-hit-80000-up-daily-…",
+  "seq": 42,
+  "bids_yes": [[450, "10.0"], [400, "5.0"]],
+  "bids_no": [[500, "8.0"]],
+  "book_hash": "0x…"
+}</pre>
+        <pre>{
+  "channel": "quote",
+  "market": "btc-hit-80000-up-daily-…",
+  "best_yes_bid": 450,
+  "best_yes_ask": 550
+}</pre>
+        <p>
+          <code>best_yes_bid</code> / <code>best_yes_ask</code> match those fields on
+          <a href="#get-markets"><code>GET /markets</code></a> rows.
+        </p>
+
+        <h4><code>tape</code> / <code>tape_snapshot</code></h4>
+        <p class="ep-meta">
+          Subscribe <code>tape</code> returns <code>tape_snapshot</code> (latest ~100 events for that market,
+          plus recent chain confirms). Live events arrive as <code>tape</code>.
+          Each <code>event</code> matches one element of
+          <a href="#get-tape"><code>GET /markets/:id/tape</code></a>.
+        </p>
+        <pre>{
+  "channel": "tape_snapshot",
+  "market": "btc-hit-80000-up-daily-…",
+  "events": [ /* same as GET /markets/:id/tape items */ ]
+}</pre>
+        <pre>{
+  "channel": "tape",
+  "seq": 10,
+  "event": { "seq": 10, "ts": 1735689000, "kind": "Accepted", "order_id": 1, "market_id": "…" }
+}</pre>
+
+        <h4><code>trades</code> / <code>trades_snapshot</code></h4>
+        <p class="ep-meta">
+          Subscribe <code>trades</code> returns <code>trades_snapshot</code> (up to 200 fills for that market).
+          Each fill matches <a href="#get-trades"><code>GET /trades</code></a> items.
+          Live fills use <code>channel: "trades"</code> with a single <code>fill</code>.
+        </p>
+        <pre>{
+  "channel": "trades_snapshot",
+  "market": "btc-hit-80000-up-daily-…",
+  "fills": [ /* same as GET /trades?market=… */ ]
+}</pre>
+        <pre>{
+  "channel": "trades",
+  "fill": {
+    "fill_id": 12,
+    "market_id": "btc-hit-80000-up-daily-…",
+    "yes_price": 550,
+    "size": "2.0",
+    "taker_side": "Yes",
+    "confirmed": false
+  }
+}</pre>
+
+        <h4><code>last_yes</code></h4>
+        <p class="ep-meta">
+          After each fill (instead of republishing the full markets list).
+          <code>price</code> is the fill’s Yes price (¢); same meaning as
+          <code>last_yes_price</code> on <a href="#get-markets"><code>GET /markets</code></a>.
+        </p>
+        <pre>{
+  "channel": "last_yes",
+  "market": "btc-hit-80000-up-daily-…",
+  "price": 550
+}</pre>
+
+        <h4><code>account</code></h4>
+        <p class="ep-meta">
+          Push only. Filter by <code>trader</code> (lowercase). Always includes
+          <code>volume_30d</code> and <code>taker_coeff</code> (same fields as
+          <a href="#get-account"><code>GET /account</code></a>). Variants:
+        </p>
+        <p>Deposit / withdraw delta:</p>
+        <pre>{
+  "channel": "account",
+  "trader": "0x…",
+  "op": "deposit",
+  "amount": 100000000,
+  "tx_hash": "0x…",
+  "ts": 1735689000,
+  "volume_30d": 2500000,
+  "taker_coeff": 0.07
+}</pre>
+        <p>Absolute collateral after redeem / split / merge / fill / close (and fund refresh):</p>
+        <pre>{
+  "channel": "account",
+  "trader": "0x…",
+  "collateral": 95000000,
+  "ts": 1735689000,
+  "volume_30d": 2500000,
+  "taker_coeff": 0.07
+}</pre>
+        <p>Hourly volume snapshot (optional <code>collateral</code>):</p>
+        <pre>{
+  "channel": "account",
+  "trader": "0x…",
+  "ts": 1735689600,
+  "volume_30d": 2500000,
+  "taker_coeff": 0.07,
+  "collateral": 95000000
+}</pre>
+
+        <h4><code>ledger</code></h4>
+        <p class="ep-meta">
+          Full snapshot after resolve / settle confirm / redeem / split / merge.
+          <code>positions</code> matches <a href="#get-ledger-positions"><code>GET /ledger/positions</code></a>;
+          <code>trades</code> matches <a href="#get-ledger-history"><code>GET /ledger/history</code></a>.
+        </p>
+        <pre>{
+  "channel": "ledger",
+  "trader": "0x…",
+  "positions": [ /* GET /ledger/positions */ ],
+  "trades": [ /* GET /ledger/history */ ]
+}</pre>
+
+        <h4><code>ledger_delta</code></h4>
+        <p class="ep-meta">
+          Match-time patch (merge into local state; do not replace full history).
+          <code>trades</code> / <code>positions</code> items use the same shapes as
+          <a href="#get-ledger-history"><code>GET /ledger/history</code></a> and
+          <a href="#get-ledger-positions"><code>GET /ledger/positions</code></a>.
+          <code>remove_positions</code> drops those sides from the Positions tab.
+        </p>
+        <pre>{
+  "channel": "ledger_delta",
+  "trader": "0x…",
+  "trades": [ /* new history rows */ ],
+  "positions": [ /* upserted position rows */ ],
+  "remove_positions": [{ "market_id": "…", "side": "Yes" }]
+}</pre>
+
+        <h4><code>holders</code></h4>
+        <p class="ep-meta">
+          After positions change on a market. <code>yes</code> / <code>no</code> match
+          <a href="#get-holders"><code>GET /markets/:id/holders</code></a>
+          (WS uses <code>market</code> instead of <code>market_id</code>).
+        </p>
+        <pre>{
+  "channel": "holders",
+  "market": "btc-hit-80000-up-daily-…",
+  "yes": [{ "trader": "0x…", "shares": "10.0", "usdc_staked": 5000000 }],
+  "no": []
+}</pre>
+
+        <h4><code>orders</code></h4>
+        <p class="ep-meta">
+          Open-order snapshot for one trader after cancel-all or market lock cancels.
+          <code>orders</code> matches <a href="#get-ledger-orders"><code>GET /ledger/orders</code></a>.
+        </p>
+        <pre>{
+  "channel": "orders",
+  "trader": "0x…",
+  "orders": [ /* same as GET /ledger/orders */ ]
+}</pre>
+
+        <nav class="docs-pager" aria-label="Page">
+          <a href="/contract">&lt;&lt; Contract</a>
+          <span class="sep">|</span>
+          <span class="muted">&gt;&gt; —</span>
+        </nav>
+      </main>
+    </div>
+  </body>
+</html>

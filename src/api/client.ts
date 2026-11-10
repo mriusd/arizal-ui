@@ -15,7 +15,9 @@ import type {
   MarketChart,
   CancelAll,
   CancelAllResult,
+  CancelOrder,
   PlaceOrder,
+  ReferralsReport,
   Version,
 } from "./types";
 
@@ -53,23 +55,60 @@ export const api = {
     j<Account>(
       `/v1/account?trader=${trader}${market ? `&market=${encodeURIComponent(market)}` : ""}`
     ),
+  setReferrer: (body: { trader: string; referrer: string }) =>
+    j<{ ok: boolean; trader: string; referrer: string; newly_set: boolean }>("/v1/account/referrer", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  referrals: (trader: string) =>
+    j<ReferralsReport>(`/v1/account/referrals?trader=${encodeURIComponent(trader)}`),
+  setNickname: (body: { trader: string; nickname: string; nonce: number; signature: string }) =>
+    j<{ ok: boolean; trader: string; nickname: string }>("/v1/account/nickname", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  setEmail: (body: { trader: string; email: string; nonce: number; signature: string }) =>
+    j<{
+      ok: boolean;
+      trader: string;
+      email: string;
+      email_verified: boolean;
+      email_sent: boolean;
+      verification_code?: string;
+      code_expires_at: number;
+      resend_after?: number;
+    }>("/v1/account/email", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  resendEmailCode: (body: { trader: string; nonce: number; signature: string }) =>
+    j<{
+      ok: boolean;
+      trader: string;
+      email: string;
+      email_verified: boolean;
+      email_sent: boolean;
+      verification_code?: string;
+      code_expires_at: number;
+      resend_after?: number;
+    }>("/v1/account/email/resend", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  verifyEmail: (body: { trader: string; code: string }) =>
+    j<{ ok: boolean; trader: string; email: string | null; email_verified: boolean }>(
+      "/v1/account/email/verify",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      }
+    ),
   ledgerOrders: (trader: string) => j<LedgerOrder[]>(`/v1/ledger/orders?trader=${trader}`),
-  ledgerTrades: (trader: string) => j<LedgerTrade[]>(`/v1/ledger/trades?trader=${trader}`),
+  ledgerHistory: (trader: string) => j<LedgerTrade[]>(`/v1/ledger/history?trader=${trader}`),
   ledgerPositions: (trader: string) => j<LedgerPos[]>(`/v1/ledger/positions?trader=${trader}`),
-  ledgerClosed: (trader: string) => j<LedgerTrade[]>(`/v1/ledger/closed?trader=${trader}`),
   ledgerFunds: (trader: string) => j<LedgerFund[]>(`/v1/ledger/funds?trader=${trader}`),
   notePending: (body: { trader: string; op: string; amount: string; market_id?: string; tx_hash: string }) =>
     j<{ ok: boolean; status: string }>("/v1/ledger/pending", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  merge: (body: { trader: string; market_id: string; shares: string; nonce: number; signature: string }) =>
-    j<{ pairs: string; payout: number }>(`/v1/positions/merge`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  split: (body: { trader: string; market_id: string; shares: string; nonce: number; signature: string }) =>
-    j<{ shares: string }>(`/v1/positions/split`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
@@ -78,7 +117,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  cancel: (id: number, body: { trader: string; market_id: string; nonce: number; signature: string }) =>
+  cancel: (id: number, body: CancelOrder) =>
     j(`/v1/orders/${id}`, { method: "DELETE", body: JSON.stringify(body) }),
   cancelAll: (body: CancelAll) =>
     j<CancelAllResult>("/v1/orders/cancel-all", { method: "POST", body: JSON.stringify(body) }),
@@ -96,16 +135,6 @@ export const api = {
       amount_eth: string;
       amount_usdc: string;
     }>("/v1/faucet", {
-      method: "POST",
-      body: JSON.stringify({ address }),
-    }),
-  faucetUsdc: (address: string) =>
-    j<{ tx_hash: string; amount: string; address: string }>("/v1/faucet/usdc", {
-      method: "POST",
-      body: JSON.stringify({ address }),
-    }),
-  faucetGas: (address: string) =>
-    j<{ tx_hash: string; amount_eth: string; address: string }>("/v1/faucet/gas", {
       method: "POST",
       body: JSON.stringify({ address }),
     }),

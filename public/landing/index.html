@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Arizal Exchange — crypto prediction markets on an immutable USDC contract. Hit, above, and between markets. Daily and longer."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="landing.css" />
+    <title>Arizal Exchange</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">
+        <img src="logo.svg" alt="" width="28" height="28" />
+        arizal<span>.xyz</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary">
+        <a href="https://docs.arizal.xyz/">Docs</a>
+        <a class="cta" href="https://app.arizal.xyz/">Open exchange</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="brand-lockup" aria-hidden="true">
+            <img src="logo.svg" alt="" width="56" height="56" />
+            <span>arizal<span class="dot">.xyz</span></span>
+          </p>
+          <h1>Crypto prediction markets, built to last.</h1>
+          <p class="lede">
+            Timed Yes/No markets on crypto prices. Matching off-chain. Settlement on a single immutable USDC contract.
+          </p>
+          <div class="cta-row">
+            <a class="cta primary" href="https://app.arizal.xyz/">Open exchange</a>
+            <a class="cta ghost" href="https://docs.arizal.xyz/">Read the docs</a>
+          </div>
+        </div>
+        <div class="hero-visual" aria-hidden="true">
+          <div class="viz-panel">
+            <div class="viz-row">
+              <span class="lbl">BTC hit</span>
+              <span class="pill yes">YES 42¢</span>
+              <span class="pill no">NO 58¢</span>
+            </div>
+            <div class="viz-row">
+              <span class="lbl">above</span>
+              <span class="pill yes">YES 31¢</span>
+              <span class="pill no">NO 69¢</span>
+            </div>
+            <div class="viz-row">
+              <span class="lbl">between</span>
+              <span class="pill yes">YES 27¢</span>
+              <span class="pill no">NO 73¢</span>
+            </div>
+            <div class="viz-book">
+              <div class="ask" style="--w: 72%"></div>
+              <div class="ask" style="--w: 48%"></div>
+              <div class="spread">spread</div>
+              <div class="bid" style="--w: 55%"></div>
+              <div class="bid" style="--w: 88%"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="block kinds" id="markets">
+        <h2>Three kinds of markets</h2>
+        <p class="section-lede">Daily is the shortest horizon. No 5m or 15m casino flips — by design.</p>
+        <ul class="kind-list">
+          <li>
+            <h3>Hit</h3>
+            <p>Yes if spot touches the barrier before expiry. The path matters.</p>
+          </li>
+          <li>
+            <h3>Above</h3>
+            <p>Yes if spot finishes at or above the barrier at expiry.</p>
+          </li>
+          <li>
+            <h3>Between</h3>
+            <p>Yes if spot finishes inside a low–high band at expiry.</p>
+          </li>
+        </ul>
+      </section>
+
+      <section class="block timeframes" id="timeframes">
+        <h2>Timeframes</h2>
+        <p class="section-lede">
+          Every market expires at an America/New_York midnight. Books run from the next daily close out to
+          <strong>up to two years</strong> ahead — so you can trade near-term and longer-dated views on the same board.
+        </p>
+        <ul class="kind-list timeframe-list">
+          <li>
+            <h3>Daily</h3>
+            <p>Next ET midnights. The shortest Arizal horizon.</p>
+          </li>
+          <li>
+            <h3>Weekly</h3>
+            <p>Mondays 00:00 ET. Week-scale moves without minute-scale noise.</p>
+          </li>
+          <li>
+            <h3>Monthly</h3>
+            <p>1st of the month 00:00 ET. Position for calendar months.</p>
+          </li>
+          <li>
+            <h3>Quarterly</h3>
+            <p>Jan / Apr / Jul / Oct 1 ET. Longer tenors, up to ~2 years out.</p>
+          </li>
+        </ul>
+      </section>
+
+      <section class="block philosophy" id="philosophy">
+        <h2>How we build</h2>
+        <ul class="phil-list">
+          <li>
+            <strong>One immutable contract.</strong>
+            Single-file, not upgradeable. A change means a new deploy at a new address.
+          </li>
+          <li>
+            <strong>Simple enough to audit.</strong>
+            Small surface area, open on Etherscan — readable by people and by AI.
+          </li>
+          <li>
+            <strong>Minimal UI.</strong>
+            Few libraries, proprietary application code, no unnecessary layers.
+          </li>
+          <li>
+            <strong>Independent.</strong>
+            No VC. Bootstrapped by a team with 8+ years shipping decentralized apps.
+          </li>
+          <li>
+            <strong>Security by hand.</strong>
+            AI for toil; core logic audited by humans. The lineage is EtherDelta — still secure.
+          </li>
+        </ul>
+      </section>
+
+      <section class="block close">
+        <h2>Trade on Arizal</h2>
+        <p class="section-lede">The exchange lives at app.arizal.xyz. Docs at docs.arizal.xyz.</p>
+        <div class="cta-row">
+          <a class="cta primary" href="https://app.arizal.xyz/">Open exchange</a>
+          <a class="cta ghost" href="https://docs.arizal.xyz/">Documentation</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span class="brand-mini">arizal<span>.xyz</span></span>
+      <span class="muted">Crypto prediction markets</span>
+    </footer>
+  </body>
+</html>

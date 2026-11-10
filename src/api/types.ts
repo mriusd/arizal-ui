@@ -14,13 +14,26 @@ export interface SignedOrder {
   nonce: number;
   salt: number;
   expires_at: number;
+  /** Absolute USDC raw; ≥ 80% of config `gas_fee`, or `0` when `order_type` is PostOnly. */
+  gas_fee: number;
   chain_id: number;
   verifying_contract: `0x${string}`;
+}
+
+/** Off-chain EIP-712 ApproveAgent proof (no chain tx). */
+export interface AgentAuth {
+  arizal_chain: string;
+  agent_address: string;
+  nonce: number;
+  expires_at: number;
+  signature: string;
 }
 
 export interface PlaceOrder {
   order: SignedOrder;
   signature: string;
+  /** Required when `signature` is from a session agent, not the main wallet. */
+  agent_auth?: AgentAuth;
   close?: boolean;
 }
 
@@ -29,6 +42,7 @@ export interface CancelOrder {
   market_id: string;
   nonce: number;
   signature: string;
+  agent_auth?: AgentAuth;
 }
 
 export interface CancelAll {
@@ -36,6 +50,7 @@ export interface CancelAll {
   market_id?: string;
   nonce: number;
   signature: string;
+  agent_auth?: AgentAuth;
 }
 
 export interface CancelAllResult {
@@ -156,6 +171,21 @@ export interface Account {
   collateral: number;
   reserved: number;
   available: number;
+  /** 30d weighted volume in micro-USD (same scale as balance). */
+  volume_30d?: number;
+  /** Taker fee coefficient for this wallet's volume tier (e.g. 0.07). */
+  taker_coeff?: number;
+  nickname?: string | null;
+  email?: string | null;
+  email_verified?: boolean;
+  /** Referring wallet; set once on first connect with `?r=`. */
+  referrer?: string | null;
+  /** Lifetime weighted volume from referred takers (micro-USD). */
+  referred_taker_volume?: number;
+  /** Lifetime weighted volume from referred makers (micro-USD). */
+  referred_maker_volume?: number;
+  /** Lifetime taker fees paid by referred wallets (USDC raw / micro-USD). */
+  referred_taker_fees?: number;
   yes_shares: string | number;
   no_shares: string | number;
   yes_usdc_staked?: number;
@@ -175,6 +205,21 @@ export interface Account {
   }[];
 }
 
+export interface ReferralRow {
+  trader: string;
+  taker_volume: number;
+  maker_volume: number;
+  taker_fees: number;
+}
+
+export interface ReferralsReport {
+  trader: string;
+  referrals: ReferralRow[];
+  referred_taker_volume: number;
+  referred_maker_volume: number;
+  referred_taker_fees: number;
+}
+
 export interface LedgerOrder {
   id: number;
   market_id: string;
@@ -183,6 +228,8 @@ export interface LedgerOrder {
   size: string;
   remaining: string;
   tif: string;
+  /** Unix seconds; 0 / omitted = no order expiry (GTC). */
+  expires_at?: number;
   status: string;
   ts: number;
 }
@@ -283,6 +330,8 @@ export interface Config {
   tif?: Tif[];
   /** Polymarket-style rate scaled by 1e18 (`7e16` = 0.07). */
   trading_fee_factor?: string;
+  /** Absolute USDC raw units for Order.gasFee / settleFill taker gas. */
+  gas_fee?: number;
   /** Asset id (lowercase) → display decimals for strikes/spot. */
   assets?: Record<string, AssetConfig>;
 }

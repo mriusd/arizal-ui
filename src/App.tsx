@@ -1,13 +1,26 @@
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
+import { toast, ToastContainer } from "react-toastify";
+import "react-toastify/dist/ReactToastify.css";
 import {
   useAccount,
-  useConnect,
   useDisconnect,
   usePublicClient,
   useSwitchChain,
   useWriteContract,
 } from "wagmi";
-import { formatEther, formatUnits, parseUnits, zeroAddress, type Address, type Hex } from "viem";
+import { formatUnits, parseUnits, type Address, type Hex } from "viem";
 import { getWalletClient } from "wagmi/actions";
 import { api, wsUrl } from "./api/client";
 import { centsToDecicents, complementAsk, decicentsToCents, fmtPriceDecicents, MAX_DECICENTS } from "./price";
@@ -22,14 +35,39 @@ import type {
   LedgerTrade,
   Market,
   MarketChart,
+  ReferralsReport,
   Side,
   SignedOrder,
   Tif,
 } from "./api/types";
-import { cancelAllMarketId, cancelAllTypes, cancelTypes, domain, marketIdHash, orderMessage, orderTypes } from "./eip712";
+import {
+  cancelAllMarketId,
+  cancelAllTypes,
+  cancelTypes,
+  domain,
+  marketIdHash,
+  orderMessage,
+  orderTypes,
+  resendEmailCodeMessage,
+  setEmailMessage,
+  setNicknameMessage,
+} from "./eip712";
 import { exchangeAbi, usdcAbi } from "./abi";
-import { clearTradingAccount, createTradingAccount, loadTradingAccount } from "./tradingKey";
-import { config, localChain } from "./wagmi";
+import {
+  clearTradingAccount,
+  createTradingAccount,
+  loadAgentAuth,
+  loadTradingAccount,
+  saveAgentAuth,
+} from "./tradingKey";
+import {
+  connHealthFromFlags,
+  tradingSessionOf,
+  type Overlay,
+  type PlacePhase,
+} from "./state/machines";
+import { Tooltip } from "./components/Tooltip";
+import { appKit, config, localChain } from "./wagmi";
 
 type TapeEvent = {
   seq?: number;
@@ -117,22 +155,6 @@ function approxVwapDecicents(levels: BookLevel[], want: number): number | null {
   return notional / filled;
 }
 
-/** Taker fee in USDC. Matches engine `taker_fee` (price in decicents, factor / 1e18). */
-function estimateTakerFeeUsdc(sizeShares: number, priceDecicents: number, factorStr?: string): number {
-  if (!(sizeShares > 0) || !(priceDecicents > 0) || priceDecicents >= 1000) return 0;
-  let factor = 0n;
-  try {
-    factor = BigInt(factorStr || "0");
-  } catch {
-    return 0;
-  }
-  if (factor <= 0n) return 0;
-  const sizeRaw = BigInt(Math.round(sizeShares * 1_000_000));
-  const curve = BigInt(Math.round(priceDecicents)) * BigInt(1000 - Math.round(priceDecicents));
-  const feeRaw = (sizeRaw * factor * curve) / (10n ** 18n * 1_000_000n);
-  return Number(feeRaw) / 1_000_000;
-}
-
 function barrierKey(m: Market): bigint {
   try {
     return BigInt(m.barrier || "0");
@@ -159,6 +181,59 @@ type MyFill = {
   logIndex?: number;
   block?: number;
 };
+
+/**
+ * 30d volume tiers use the Polymarket-style taker fee coefficient (same shape as
+ * clearbook `trading_fee_factor / 1e18`), not a flat % of notional:
+ *   fee = shares × coefficient × p × (1 − p)
+ * with p in dollars. Only the taker pays; makers have no fee.
+ */
+type FeeTier = { tier: number; minVolume: number; label: string; takerCoeff: number };
+
+const FEE_TIERS: FeeTier[] = [
+  { tier: 0, minVolume: 0, label: "Base", takerCoeff: 0.07 },
+  { tier: 1, minVolume: 2_000, label: ">$2k", takerCoeff: 0.065 },
+  { tier: 2, minVolume: 20_000, label: ">$20k", takerCoeff: 0.06 },
+  { tier: 3, minVolume: 200_000, label: ">$200k", takerCoeff: 0.055 },
+  { tier: 4, minVolume: 1_000_000, label: ">$1M", takerCoeff: 0.05 },
+  { tier: 5, minVolume: 4_000_000, label: ">$4M", takerCoeff: 0.045 },
+  { tier: 6, minVolume: 10_000_000, label: ">$10M", takerCoeff: 0.04 },
+];
+
+function feeTierForVolume(volumeUsd: number): FeeTier {
+  let tier = FEE_TIERS[0];
+  for (const t of FEE_TIERS) {
+    if (volumeUsd >= t.minVolume) tier = t;
+  }
+  return tier;
+}
+
+function feeTierProgress(volumeUsd: number): {
+  current: FeeTier;
+  next: FeeTier | null;
+  pct: number;
+  remaining: number;
+} {
+  const current = feeTierForVolume(volumeUsd);
+  const idx = FEE_TIERS.findIndex((t) => t.minVolume === current.minVolume);
+  const next = idx >= 0 && idx < FEE_TIERS.length - 1 ? FEE_TIERS[idx + 1] : null;
+  if (!next) return { current, next: null, pct: 100, remaining: 0 };
+  const span = next.minVolume - current.minVolume;
+  const done = Math.max(0, volumeUsd - current.minVolume);
+  const pct = span > 0 ? Math.min(100, (done / span) * 100) : 100;
+  return { current, next, pct, remaining: Math.max(0, next.minVolume - volumeUsd) };
+}
+
+function fmtVolumeUsd(n: number): string {
+  if (!(n > 0)) return "$0";
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(n >= 10_000_000 ? 1 : 2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+function fmtTakerFeeCoeff(coeff: number): string {
+  return coeff.toFixed(3);
+}
 
 type MinePos = {
   marketId: string;
@@ -234,6 +309,17 @@ type MarketsTfTab = "daily" | "weekly" | "monthly" | "quarterly";
 
 type TopQuote = { bid: number | null; ask: number | null };
 
+function quotesFromMarkets(ms: Market[]): Record<string, TopQuote> {
+  const next: Record<string, TopQuote> = {};
+  for (const m of ms) {
+    next[m.id] = {
+      bid: typeof m.best_yes_bid === "number" ? m.best_yes_bid : null,
+      ask: typeof m.best_yes_ask === "number" ? m.best_yes_ask : null,
+    };
+  }
+  return next;
+}
+
 function bestBidAsk(book: Book | null | undefined): TopQuote {
   if (!book) return { bid: null, ask: null };
   const live = (rows: BookLevel[]) => rows.filter(([, s]) => s !== "" && Number(s) > 0);
@@ -294,16 +380,16 @@ const ASSET_PILL_COLOR: Record<string, string> = {
 };
 
 const KIND_PILL_COLOR: Record<string, string> = {
-  hit: "#6a8fad",
-  above: "#9a7bb8",
-  between: "#4a9e8e",
+  hit: "#7ec8f5",
+  above: "#d2a8f0",
+  between: "#5edcc0",
 };
 
 const TIMEFRAME_PILL_COLOR: Record<string, string> = {
-  daily: "#c4a35a",
-  weekly: "#b8894a",
-  monthly: "#a87878",
-  quarterly: "#7a8aad",
+  daily: "#e8b84a",
+  weekly: "#e0922e",
+  monthly: "#c48cff",
+  quarterly: "#8aa8ff",
 };
 
 /** API OrderStatus is snake_case (`resting`); tolerate PascalCase too. */
@@ -319,14 +405,17 @@ function timeframePillLabel(tf: string): string {
   return "Daily";
 }
 
+/** Market expiries are America/New_York calendar midnights — format pills in that zone. */
+const EXPIRY_TZ = "America/New_York";
+
 function fmtExpiryPill(expiresAt: number | undefined, timeframe?: string): string {
   if (!expiresAt || expiresAt <= 0) return "—";
   const d = new Date(expiresAt * 1000);
   if (timeframe === "quarterly") {
-    return d.toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+    return d.toLocaleDateString("en-US", { month: "short", year: "2-digit", timeZone: EXPIRY_TZ });
   }
-  // daily / weekly / monthly — day + month (e.g. 10 Nov)
-  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  // daily / weekly / monthly — day + month in ET (e.g. 10 Nov)
+  return d.toLocaleDateString("en-US", { day: "numeric", month: "short", timeZone: EXPIRY_TZ });
 }
 
 function kindPillLabel(kind: string): string {
@@ -374,10 +463,17 @@ function StrikePill({
   priceDp?: number;
 }) {
   const strike = market ? strikeLabel(market, priceDp) : "—";
-  const level = strikeUsd(market);
+  const kind = (market?.kind || "hit").toLowerCase();
+  const strikeUp = "#2a8a58";
+  const strikeDown = "#a84a42";
   let color = "#8a969e";
-  if (spotUsd != null && level != null) {
-    color = spotUsd >= level ? "#3dba7a" : "#e06a5c";
+  if (kind === "hit") {
+    color = market?.direction === "down" ? strikeDown : strikeUp;
+  } else {
+    const level = strikeUsd(market);
+    if (spotUsd != null && level != null) {
+      color = spotUsd >= level ? strikeUp : strikeDown;
+    }
   }
   return (
     <span className="mkt-pill" style={pillStyle(color)} title={marketId}>
@@ -389,9 +485,50 @@ function StrikePill({
 function expiryPillColor(expiresAt: number | undefined, nowSec: number): string {
   if (!expiresAt || expiresAt <= 0) return "#8a969e";
   const left = expiresAt - nowSec;
-  if (left < 24 * 3600) return "#e06a5c";
-  if (left < 72 * 3600) return "#d4a017";
-  return "#3dba7a";
+  if (left < 24 * 3600) return "#a84a42";
+  if (left < 72 * 3600) return "#a07a12";
+  return "#2a8a58";
+}
+
+function fmtExpiryRemaining(expiresAt: number | undefined, nowSec: number): string | null {
+  if (!expiresAt || expiresAt <= 0) return null;
+  const left = expiresAt - nowSec;
+  if (left <= 0) return null;
+  if (left < 24 * 3600) return `${Math.max(1, Math.ceil(left / 3600))}H`;
+  return `${Math.floor(left / (24 * 3600))}D`;
+}
+
+function fmtExpiryTs(expiresAt: number, timeZone?: string): string {
+  return new Date(expiresAt * 1000).toLocaleString("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+function fmtExpiryCountdown(expiresAt: number, nowSec: number): string {
+  const left = expiresAt - nowSec;
+  if (left <= 0) return "expired";
+  const d = Math.floor(left / 86400);
+  const h = Math.floor((left % 86400) / 3600);
+  const m = Math.floor((left % 3600) / 60);
+  return `${d}d ${h}h ${m}m`;
+}
+
+function expiryTooltipContent(expiresAt: number, nowSec: number): ReactNode {
+  return (
+    <>
+      <div>
+        {fmtExpiryTs(expiresAt, EXPIRY_TZ)} ({EXPIRY_TZ})
+      </div>
+      <div>{fmtExpiryTs(expiresAt)} (local)</div>
+      <div>{fmtExpiryCountdown(expiresAt, nowSec)} left</div>
+    </>
+  );
 }
 
 function ExpiryPill({
@@ -399,18 +536,46 @@ function ExpiryPill({
   marketId,
   expiresAt,
   nowSec,
+  showRemaining = true,
 }: {
   market?: Market | null;
   marketId?: string;
   expiresAt?: number;
   nowSec?: number;
+  showRemaining?: boolean;
 }) {
   const ts = expiresAt ?? market?.expires_at;
   const now = nowSec ?? Math.floor(Date.now() / 1000);
+  const [tipNow, setTipNow] = useState<number | null>(null);
+  const tipActive = tipNow != null;
+  useEffect(() => {
+    if (!tipActive) return;
+    const id = window.setInterval(() => setTipNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => window.clearInterval(id);
+  }, [tipActive]);
   const expiry = fmtExpiryPill(ts, market?.timeframe);
+  const remaining = showRemaining ? fmtExpiryRemaining(ts, now) : null;
+  const hasExpiry = !!ts && ts > 0;
+  const tipClock = tipNow ?? Math.floor(Date.now() / 1000);
+  const pill = (
+    <span className="mkt-pill" style={pillStyle(expiryPillColor(ts, now))} title={hasExpiry ? undefined : marketId}>
+      {remaining ? `${expiry} ${remaining}` : expiry}
+    </span>
+  );
+  if (!hasExpiry || !ts) return pill;
   return (
-    <span className="mkt-pill" style={pillStyle(expiryPillColor(ts, now))} title={marketId}>
-      {expiry}
+    <span
+      className="mkt-pill-tip-wrap"
+      onMouseEnter={() => setTipNow(Math.floor(Date.now() / 1000))}
+      onMouseLeave={() => setTipNow(null)}
+      onFocusCapture={() => setTipNow(Math.floor(Date.now() / 1000))}
+      onBlurCapture={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setTipNow(null);
+      }}
+    >
+      <Tooltip content={expiryTooltipContent(ts, tipClock)} className="mkt-pill-tip">
+        {pill}
+      </Tooltip>
     </span>
   );
 }
@@ -526,6 +691,7 @@ const MarketHistory = memo(function MarketHistory({
   mid,
   spotUsd,
   nowSec,
+  quotes,
   onOpen,
   marketsTab,
   onMarketsTab,
@@ -538,6 +704,7 @@ const MarketHistory = memo(function MarketHistory({
   mid: string;
   spotUsd: number | null;
   nowSec: number;
+  quotes: Record<string, TopQuote>;
   onOpen: (id: string, side: Side) => void;
   marketsTab: MarketsKindTab;
   onMarketsTab: (tab: MarketsKindTab) => void;
@@ -590,17 +757,7 @@ const MarketHistory = memo(function MarketHistory({
     );
   }, [live, priceDp]);
 
-  // Top-of-book rides the markets list/WS (memory on the node) — no per-cell /book polls.
-  const quotes = useMemo(() => {
-    const next: Record<string, TopQuote> = {};
-    for (const m of live) {
-      next[m.id] = {
-        bid: typeof m.best_yes_bid === "number" ? m.best_yes_bid : null,
-        ask: typeof m.best_yes_ask === "number" ? m.best_yes_ask : null,
-      };
-    }
-    return next;
-  }, [live]);
+  // Top-of-book from the quotes map (updated in place on WS `quote` — not via remapping markets).
   const spotLineRef = useRef<HTMLTableRowElement>(null);
 
   // Rows are high→low. Insert the spot marker before the first strike at or below spot.
@@ -642,16 +799,28 @@ const MarketHistory = memo(function MarketHistory({
     <div className="market-grid">
       <div className="book-head">
         <h2>Markets</h2>
-        <div className="tabs">
+        <div className="tabs mkt-pill-tabs">
           {(["hit", "above", "between"] as const).map((k) => (
-            <button key={k} className={kind === k ? "active" : ""} onClick={() => onMarketsTab(k)}>
-              {k === "hit" ? "Hit" : k === "above" ? "Above" : "Between"}
+            <button
+              key={k}
+              type="button"
+              className={`mkt-pill mkt-pill-tab${kind === k ? " active" : ""}`}
+              style={pillStyle(KIND_PILL_COLOR[k])}
+              onClick={() => onMarketsTab(k)}
+            >
+              {kindPillLabel(k)}
             </button>
           ))}
           <span className="tab-sep" aria-hidden="true" />
           {(["daily", "weekly", "monthly", "quarterly"] as const).map((t) => (
-            <button key={t} className={marketsTf === t ? "active" : ""} onClick={() => onMarketsTf(t)}>
-              {t === "daily" ? "Daily" : t === "weekly" ? "Weekly" : t === "monthly" ? "Monthly" : "Quarterly"}
+            <button
+              key={t}
+              type="button"
+              className={`mkt-pill mkt-pill-tab${marketsTf === t ? " active" : ""}`}
+              style={pillStyle(TIMEFRAME_PILL_COLOR[t])}
+              onClick={() => onMarketsTf(t)}
+            >
+              {timeframePillLabel(t)}
             </button>
           ))}
         </div>
@@ -778,6 +947,7 @@ const MarketPicker = memo(function MarketPicker({
   open,
   onToggle,
   rows,
+  quotes,
   marketsTab,
   onMarketsTab,
   marketsTf,
@@ -788,6 +958,7 @@ const MarketPicker = memo(function MarketPicker({
 }: {
   market: Market | null;
   quote: TopQuote;
+  quotes: Record<string, TopQuote>;
   spotRaw: string | null;
   nowSec: number;
   open: boolean;
@@ -873,7 +1044,6 @@ const MarketPicker = memo(function MarketPicker({
           <span className="lbl">Expires</span>
           <span className="val market-bar-expiry">
             <ExpiryPill market={market} marketId={market?.id} nowSec={nowSec} />
-            <span className="mono">{fmtCountdown(market?.expires_at, nowSec)}</span>
           </span>
         </div>
         <span className="market-chev" aria-hidden>
@@ -887,6 +1057,7 @@ const MarketPicker = memo(function MarketPicker({
             mid={market?.id || ""}
             spotUsd={spot}
             nowSec={nowSec}
+            quotes={quotes}
             marketsTab={marketsTab}
             onMarketsTab={onMarketsTab}
             marketsTf={marketsTf}
@@ -911,7 +1082,18 @@ type ChartTf = (typeof CHART_TF)[number][0];
 
 const UI_PREFS_KEY = "clearbook.ui";
 
-type MineTab = "positions" | "closed" | "orders" | "trades" | "funds";
+type MineTab = "positions" | "orders" | "history" | "funds";
+
+/** Limit-order expiry preset in the place panel. */
+type ExpiryChoice = "never" | "5m" | "1h" | "12h" | "24h" | "custom" | "saved";
+
+type CustomExpiry = {
+  /** Cancel this many seconds before market expiry. */
+  mode: "before_market" | "absolute";
+  beforeSecs: number;
+  /** Absolute unix seconds (local calendar). */
+  atUnix: number;
+};
 
 type UiPrefs = {
   mineTab: MineTab;
@@ -923,12 +1105,88 @@ type UiPrefs = {
   entryKind: "limit" | "market" | "merge" | "split";
   price: number;
   size: string;
-  tif: Tif;
-  expiresAt: number;
+  expiryChoice: ExpiryChoice;
+  savedExpiry: CustomExpiry | null;
+};
+
+const EXPIRY_PRESET_SECS: Record<"5m" | "1h" | "12h" | "24h", number> = {
+  "5m": 5 * 60,
+  "1h": 60 * 60,
+  "12h": 12 * 60 * 60,
+  "24h": 24 * 60 * 60,
 };
 
 function oneOf<T extends string>(v: unknown, allowed: readonly T[], fallback: T): T {
   return typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+function defaultCustomExpiry(nowSec = Math.floor(Date.now() / 1000)): CustomExpiry {
+  return { mode: "before_market", beforeSecs: 5 * 3600, atUnix: nowSec + 3600 };
+}
+
+function parseCustomExpiry(v: unknown, fallback: CustomExpiry): CustomExpiry {
+  if (!v || typeof v !== "object") return fallback;
+  const o = v as Partial<CustomExpiry>;
+  const mode = o.mode === "absolute" ? "absolute" : "before_market";
+  const beforeSecs = Number(o.beforeSecs);
+  const atUnix = Number(o.atUnix);
+  return {
+    mode,
+    beforeSecs: Number.isFinite(beforeSecs) && beforeSecs >= 0 ? Math.floor(beforeSecs) : fallback.beforeSecs,
+    atUnix: Number.isFinite(atUnix) && atUnix > 0 ? Math.floor(atUnix) : fallback.atUnix,
+  };
+}
+
+function fmtDurationSecs(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s === 0) return "0m";
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
+function fmtCustomExpiryLabel(c: CustomExpiry): string {
+  if (c.mode === "before_market") return `${fmtDurationSecs(c.beforeSecs)} before expiry`;
+  return new Date(c.atUnix * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function toDatetimeLocalValue(unix: number): string {
+  const d = new Date(unix * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function fromDatetimeLocalValue(s: string): number {
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? Math.floor(t / 1000) : 0;
+}
+
+function resolveLimitExpiry(
+  choice: ExpiryChoice,
+  applied: CustomExpiry | null,
+  saved: CustomExpiry | null,
+  marketExpiresAt: number | undefined,
+  nowSec: number
+): { tif: Tif; expiresAt: number } {
+  if (choice === "never") return { tif: "GTC", expiresAt: 0 };
+  if (choice === "5m" || choice === "1h" || choice === "12h" || choice === "24h") {
+    return { tif: "GTD", expiresAt: nowSec + EXPIRY_PRESET_SECS[choice] };
+  }
+  const cfg = choice === "saved" ? saved : applied;
+  if (!cfg) return { tif: "GTC", expiresAt: 0 };
+  if (cfg.mode === "before_market") {
+    const mkt = marketExpiresAt && marketExpiresAt > 0 ? marketExpiresAt : 0;
+    if (!mkt) throw new Error("market expiry unknown — pick a date/time or wait for market data");
+    return { tif: "GTD", expiresAt: mkt - cfg.beforeSecs };
+  }
+  return { tif: "GTD", expiresAt: cfg.atUnix };
 }
 
 function readUiPrefs(): UiPrefs {
@@ -942,17 +1200,32 @@ function readUiPrefs(): UiPrefs {
     entryKind: "limit",
     price: 60,
     size: "10",
-    tif: "GTC",
-    expiresAt: 0,
+    expiryChoice: "never",
+    savedExpiry: null,
   };
   try {
     const raw = localStorage.getItem(UI_PREFS_KEY);
     if (!raw) return d;
-    const v = JSON.parse(raw) as Partial<UiPrefs>;
+    const v = JSON.parse(raw) as Partial<UiPrefs> & { tif?: string };
     const price = Number(v.price);
-    const expiresAt = Number(v.expiresAt);
+    const savedExpiry = v.savedExpiry ? parseCustomExpiry(v.savedExpiry, defaultCustomExpiry()) : null;
+    let expiryChoice = oneOf(
+      v.expiryChoice,
+      ["never", "5m", "1h", "12h", "24h", "custom", "saved"],
+      d.expiryChoice
+    );
+    // Migrate legacy GTC/GTD prefs.
+    if (v.expiryChoice == null && typeof v.tif === "string") {
+      expiryChoice = v.tif === "GTD" ? "1h" : "never";
+    }
+    if (expiryChoice === "saved" && !savedExpiry) expiryChoice = "never";
+    if (expiryChoice === "custom") expiryChoice = "never";
     return {
-      mineTab: oneOf(v.mineTab, ["positions", "closed", "orders", "trades", "funds"], d.mineTab),
+      mineTab: oneOf(
+        (v.mineTab as string | undefined) === "trades" ? "history" : v.mineTab,
+        ["positions", "orders", "history", "funds"],
+        d.mineTab
+      ),
       chartTf: oneOf(v.chartTf, ["5m", "1h", "1d", "30d"], d.chartTf),
       marketsTab: oneOf(v.marketsTab, ["hit", "above", "between"], d.marketsTab),
       marketsTf: oneOf(v.marketsTf, ["daily", "weekly", "monthly", "quarterly"], d.marketsTf),
@@ -961,8 +1234,8 @@ function readUiPrefs(): UiPrefs {
       entryKind: oneOf(v.entryKind, ["limit", "market", "merge", "split"], d.entryKind),
       price: Number.isInteger(price) && price >= 1 && price <= 99 ? price : d.price,
       size: typeof v.size === "string" && v.size.length > 0 && v.size.length <= 32 ? v.size : d.size,
-      tif: oneOf(v.tif, ["GTC", "GTD", "FOK", "FAK"], d.tif),
-      expiresAt: Number.isFinite(expiresAt) && expiresAt >= 0 ? expiresAt : d.expiresAt,
+      expiryChoice,
+      savedExpiry,
     };
   } catch {
     return d;
@@ -1005,6 +1278,74 @@ function shortTx(tx?: string): string {
   return `${tx.slice(0, 10)}…`;
 }
 
+function shortAddr(addr?: string): string {
+  if (!addr || addr.length < 10) return "—";
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
+
+const REFERRER_STORAGE_KEY = "arizal.referrer";
+
+function isWalletAddress(s: string): s is `0x${string}` {
+  return /^0x[a-fA-F0-9]{40}$/.test(s);
+}
+
+/** Capture `?r=` / `?ref=` / `?referrer=` into localStorage; return the pending referrer if any. */
+function captureReferrerFromUrl(): string | null {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const raw = (q.get("r") || q.get("ref") || q.get("referrer") || "").trim();
+    if (isWalletAddress(raw)) {
+      localStorage.setItem(REFERRER_STORAGE_KEY, raw.toLowerCase());
+    }
+  } catch {
+    /* private mode */
+  }
+  try {
+    const stored = localStorage.getItem(REFERRER_STORAGE_KEY);
+    if (stored && isWalletAddress(stored)) return stored.toLowerCase();
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function clearStoredReferrer() {
+  try {
+    localStorage.removeItem(REFERRER_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Shareable referral URL for `trader` (`https://host/?r=0x…`, no market path). */
+function referralLinkFor(trader: string): string {
+  const u = new URL("/", window.location.origin);
+  u.searchParams.set("r", trader.toLowerCase());
+  return u.toString();
+}
+
+/** Deterministic jazzicon-style glyph from a wallet address. */
+function WalletGlyph({ address, size = 22 }: { address: string; size?: number }) {
+  const seed = address.toLowerCase().replace(/^0x/, "").padEnd(40, "0");
+  const n = (i: number) => parseInt(seed.slice((i * 2) % 38, (i * 2) % 38 + 2) || "00", 16);
+  const c1 = `hsl(${n(0) % 360} 58% 46%)`;
+  const c2 = `hsl(${n(3) % 360} 52% 40%)`;
+  const c3 = `hsl(${n(6) % 360} 62% 55%)`;
+  const rot = n(9) % 360;
+  const cx = 8 + (n(12) % 16);
+  const cy = 8 + (n(15) % 16);
+  const r = 5 + (n(18) % 7);
+  return (
+    <svg className="wallet-glyph" width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="16" fill={c1} />
+      <g transform={`rotate(${rot} 16 16)`}>
+        <path d="M16 0A16 16 0 0 1 16 32Z" fill={c2} />
+        <circle cx={cx} cy={cy} r={r} fill={c3} opacity="0.9" />
+      </g>
+    </svg>
+  );
+}
+
 function fmtResolvedAt(ts?: number | null): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString(undefined, {
@@ -1025,9 +1366,23 @@ function fmtLocalTime(ts: number | undefined): string {
   });
 }
 
+function fmtLocalDateTime(ts: number | undefined): string {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+const RESERVED_PATHS = new Set(["docs", "docs.html", "index.html"]);
+
 function marketIdFromPath(path: string): string {
   const p = path.replace(/^\/+|\/+$/g, "");
-  if (!p || p === "index.html") return "";
+  if (!p || RESERVED_PATHS.has(p) || p.startsWith("docs/")) return "";
   return p;
 }
 
@@ -1081,6 +1436,36 @@ function pxToUsd(raw: string | number | null | undefined): number | null {
   return neg ? -n : n;
 }
 
+/** Default landing market: soonest open daily hit-up, barrier closest to spot (else lowest rung). */
+function pickDefaultMarket(ms: Market[], spotUsd: number | null): Market | undefined {
+  const hits = ms.filter(
+    (m) =>
+      m.status === "Open" &&
+      (m.kind || "hit") === "hit" &&
+      (m.timeframe || "daily") === "daily" &&
+      (m.direction || "up") === "up"
+  );
+  if (hits.length === 0) return undefined;
+  let soonest = Number(hits[0].expires_at || 0);
+  for (const m of hits) {
+    const exp = Number(m.expires_at || 0);
+    if (exp > 0 && (soonest <= 0 || exp < soonest)) soonest = exp;
+  }
+  const today = hits.filter((m) => Number(m.expires_at || 0) === soonest);
+  let best = today[0];
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const m of today) {
+    const b = pxToUsd(m.barrier);
+    if (b == null) continue;
+    const dist = spotUsd != null ? Math.abs(b - spotUsd) : b;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = m;
+    }
+  }
+  return best;
+}
+
 function strikeUsd(m: Market | null | undefined): number | null {
   if (!m) return null;
   const lo = pxToUsd(m.barrier);
@@ -1132,6 +1517,31 @@ function countdownTone(expiresAt: number | undefined, now: number): "ok" | "warn
   return "ok";
 }
 
+/** Second-precision countdown isolated so the rest of the app need not re-render at 1Hz. */
+const LiveCountdown = memo(function LiveCountdown({
+  expiresAt,
+  className,
+  title,
+}: {
+  expiresAt: number | undefined;
+  className?: string;
+  title?: string;
+}) {
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    if (!expiresAt || expiresAt <= 0) return;
+    const id = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [expiresAt]);
+  const tone = countdownTone(expiresAt, now);
+  const cls = [className, className?.includes("chart-countdown") ? tone : null].filter(Boolean).join(" ");
+  return (
+    <span className={cls || undefined} title={title}>
+      {fmtCountdown(expiresAt, now)}
+    </span>
+  );
+});
+
 /** Compact time-to-expiry: `3d` when ≥1d, else `5h`. */
 function fmtExpLeft(expiresAt: number | undefined, now: number): string {
   if (!expiresAt || expiresAt <= 0) return "—";
@@ -1139,6 +1549,14 @@ function fmtExpLeft(expiresAt: number | undefined, now: number): string {
   if (s <= 0) return "0h";
   if (s >= 86400) return `${Math.floor(s / 86400)}d`;
   return `${Math.max(1, Math.ceil(s / 3600))}h`;
+}
+
+/** Order expiry left: `3h`, or minutes when under 1h (`12m`). */
+function fmtOrderExpiresLeft(expiresAt: number, now: number): string {
+  const s = Math.max(0, expiresAt - now);
+  if (s <= 0) return "0m";
+  if (s >= 3600) return `${Math.floor(s / 3600)}h`;
+  return `${Math.max(1, Math.ceil(s / 60))}m`;
 }
 
 function assetLabel(symbol: string | undefined): string {
@@ -1151,21 +1569,28 @@ function assetLabel(symbol: string | undefined): string {
 export function App() {
   const { address: trader, isConnected, chainId: walletChainId } = useAccount();
   const walletOn = isConnected;
-  const { connect, connectors } = useConnect();
   const { disconnect } = useDisconnect();
   const { switchChainAsync } = useSwitchChain();
   const publicClient = usePublicClient({ chainId: localChain.id });
   const { writeContractAsync: writeInjected } = useWriteContract();
   const onHardhat = walletChainId === localChain.id;
-  /** On-chain authorizeSession wallet matches the browser key and is unexpired. */
+  /** Browser session key + stored ApproveAgent are present and unexpired. */
   const [tradingEnabled, setTradingEnabled] = useState(false);
 
   const [cfg, setCfg] = useState<Config | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
-  const [marketId, setMarketId] = useState<string>(() => marketIdFromPath(window.location.pathname));
+  /** Top-of-book by market id — kept separate so quote WS does not remap the full markets list. */
+  const [quotesById, setQuotesById] = useState<Record<string, TopQuote>>({});
+  const [marketId, setMarketId] = useState<string>(() => {
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+    if (path === "docs" || path === "docs.html" || path.startsWith("docs/")) {
+      window.location.replace("https://docs.arizal.xyz/");
+      return "";
+    }
+    return marketIdFromPath(window.location.pathname);
+  });
   const [book, setBook] = useState<Book | null>(null);
   const [acct, setAcct] = useState<Account | null>(null);
-  const [walletUsdc, setWalletUsdc] = useState<bigint>(0n);
   const [trades, setTrades] = useState<Fill[]>([]);
   const [fillTx, setFillTx] = useState<Record<number, string>>({});
   const [chart, setChart] = useState<MarketChart | null>(null);
@@ -1176,8 +1601,6 @@ export function App() {
   const [mineTab, setMineTab] = useState(savedUi.mineTab);
   const [positions, setPositions] = useState<MinePos[]>([]);
   const [myFills, setMyFills] = useState<MyFill[]>([]);
-  /** Closed positions tab — closes + redeems from ledger / WS `closed_positions`. */
-  const [closedFills, setClosedFills] = useState<MyFill[]>([]);
   const [dbOrders, setDbOrders] = useState<LedgerOrder[]>([]);
   const [funds, setFunds] = useState<LedgerFund[]>([]);
   const [lastYes, setLastYes] = useState<Record<string, number>>({});
@@ -1185,7 +1608,10 @@ export function App() {
   const [posMids, setPosMids] = useState<Record<string, number>>({});
   const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
   const [spotRaw, setSpotRaw] = useState<string | null>(null);
-  const [marketsOpen, setMarketsOpen] = useState(false);
+  /** Exclusive overlay: markets | fees | expiry | account (see `src/state/machines.ts`). */
+  const [overlay, setOverlay] = useState<Overlay>(null);
+  const [placePhase, setPlacePhase] = useState<PlacePhase>("idle");
+  const placePhaseRef = useRef<PlacePhase>("idle");
   const [chartTf, setChartTf] = useState(savedUi.chartTf);
   const [marketsTab, setMarketsTab] = useState(savedUi.marketsTab);
   const [marketsTf, setMarketsTf] = useState(savedUi.marketsTf);
@@ -1194,32 +1620,89 @@ export function App() {
   const [entryKind, setEntryKind] = useState(savedUi.entryKind);
   const [price, setPrice] = useState(savedUi.price);
   const [size, setSize] = useState(savedUi.size);
-  const [tif, setTif] = useState(savedUi.tif);
-  const [expiresAt, setExpiresAt] = useState(savedUi.expiresAt);
+  const [postOnly, setPostOnly] = useState(false);
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(savedUi.expiryChoice);
+  const [savedExpiry, setSavedExpiry] = useState<CustomExpiry | null>(savedUi.savedExpiry);
+  const [appliedCustomExpiry, setAppliedCustomExpiry] = useState<CustomExpiry | null>(null);
+  const [customDraft, setCustomDraft] = useState<CustomExpiry>(() => savedUi.savedExpiry ?? defaultCustomExpiry());
+  const [customDraftSave, setCustomDraftSave] = useState(!!savedUi.savedExpiry);
   const [dwAmt, setDwAmt] = useState("100");
-  const [err, setErr] = useState<string>("");
+  /** Phone bottom-nav panel: Trade / Chart / Book / Account. */
+  const [mobileTab, setMobileTab] = useState<"trade" | "chart" | "book" | "account">("trade");
+  const [walletMenuOpen, setWalletMenuOpen] = useState(false);
+  const walletMenuRef = useRef<HTMLDivElement>(null);
   const [apiDown, setApiDown] = useState(false);
   const [wsDown, setWsDown] = useState(false);
-  const [msg, setMsg] = useState("");
+  const [nickDraft, setNickDraft] = useState("");
+  const [emailDraft, setEmailDraft] = useState("");
+  const [emailCodeDraft, setEmailCodeDraft] = useState("");
+  const [emailVerifyPending, setEmailVerifyPending] = useState(false);
+  const [emailResendAfter, setEmailResendAfter] = useState(0);
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [referrals, setReferrals] = useState<ReferralsReport | null>(null);
+  const [referralsLoading, setReferralsLoading] = useState(false);
+  const feeTiersDialogRef = useRef<HTMLDialogElement>(null);
+  const customExpiryDialogRef = useRef<HTMLDialogElement>(null);
+  const accountDialogRef = useRef<HTMLDialogElement>(null);
+  const referDialogRef = useRef<HTMLDialogElement>(null);
+  /** Only close modal when pointer-down started on the backdrop (not after text-select drag). */
+  const dialogBackdropDownRef = useRef(false);
+  const onDialogBackdropPointerDown = (e: ReactPointerEvent<HTMLDialogElement>) => {
+    dialogBackdropDownRef.current = e.target === e.currentTarget;
+  };
+  const onDialogBackdropClick = (e: ReactMouseEvent<HTMLDialogElement>) => {
+    if (dialogBackdropDownRef.current && e.target === e.currentTarget) setOverlay(null);
+    dialogBackdropDownRef.current = false;
+  };
+  const marketsOpen = overlay === "markets";
+  const feeTiersOpen = overlay === "fees";
+  const customExpiryOpen = overlay === "expiry";
+  const accountOpen = overlay === "account";
+  const referOpen = overlay === "refer";
+  const connHealth = connHealthFromFlags(apiDown, wsDown);
+  const tradingSession = tradingSessionOf(walletOn, tradingEnabled);
   const didInitFollow = useRef(false);
+  /** Market id chosen as the empty-path default (may be refined once spot arrives). */
+  const provisionalDefaultId = useRef<string | null>(null);
 
   useEffect(() => {
-    const prefs: UiPrefs = { mineTab, chartTf, marketsTab, marketsTf, side, intent, entryKind, price, size, tif, expiresAt };
+    const prefs: UiPrefs = {
+      mineTab,
+      chartTf,
+      marketsTab,
+      marketsTf,
+      side,
+      intent,
+      entryKind,
+      price,
+      size,
+      expiryChoice: expiryChoice === "custom" ? "never" : expiryChoice,
+      savedExpiry,
+    };
     try {
       localStorage.setItem(UI_PREFS_KEY, JSON.stringify(prefs));
     } catch {
       /* private mode */
     }
-  }, [mineTab, chartTf, marketsTab, marketsTf, side, intent, entryKind, price, size, tif, expiresAt]);
+  }, [mineTab, chartTf, marketsTab, marketsTf, side, intent, entryKind, price, size, expiryChoice, savedExpiry]);
   const midRef = useRef("");
   const marketIdRef = useRef(marketId);
   const traderRef = useRef(trader);
   const acctFundTxRef = useRef(new Set<string>());
   const wsRef = useRef<WebSocket | null>(null);
+  const spotRawPendingRef = useRef<string | null>(null);
+  const spotRawFlushAtRef = useRef(0);
+  const spotRawTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const marketsRef = useRef<Market[]>([]);
   marketsRef.current = markets;
-  const market = markets.find((m) => m.id === marketId) || markets.find((m) => m.status === "Open") || markets[0];
+  const spotRawRef = useRef(spotRaw);
+  spotRawRef.current = spotRaw;
+  const market =
+    markets.find((m) => m.id === marketId) ||
+    pickDefaultMarket(markets, pxToUsd(spotRaw)) ||
+    markets.find((m) => m.status === "Open") ||
+    markets[0];
   const mid = market?.id || marketId;
   midRef.current = mid;
   marketIdRef.current = marketId;
@@ -1231,7 +1714,138 @@ export function App() {
   const depth = useMemo(() => sideBook(book, side), [book, side]);
   const mineLevels = useMemo(() => userBookLevels(dbOrders, mid, side), [dbOrders, mid, side]);
   const gridMine = useMemo(() => buildGridMine(positions, dbOrders), [positions, dbOrders]);
+  // Account `volume_30d` / `taker_coeff` from the node (hourly UTC :00 + boot + account pushes).
+  const volume30d = useMemo(() => {
+    const raw = acct?.volume_30d;
+    if (raw == null || !Number.isFinite(Number(raw))) return 0;
+    return Number(raw) / 1e6;
+  }, [acct?.volume_30d]);
+  const feeProgress = useMemo(() => feeTierProgress(volume30d), [volume30d]);
+  const feeTier = feeProgress.current;
+  /** Wallet taker fee coefficient from GET /account + account WS (not local tier table). */
+  const walletTakerCoeff = useMemo(() => {
+    const c = acct?.taker_coeff;
+    if (c == null || !Number.isFinite(Number(c)) || Number(c) <= 0) return null;
+    return Number(c);
+  }, [acct?.taker_coeff]);
   const bookSeqRef = useRef(-1);
+
+  // Modal <dialog> uses the browser top layer; keep Toastify there (and re-stack after each modal open).
+  useEffect(() => {
+    const root = document.querySelector(".Toastify") as HTMLElement | null;
+    if (!root || typeof root.showPopover !== "function") return;
+    root.setAttribute("popover", "manual");
+    try {
+      if (root.matches(":popover-open")) root.hidePopover();
+      root.showPopover();
+    } catch {
+      /* unsupported / already transitioning */
+    }
+  }, [accountOpen, feeTiersOpen, customExpiryOpen, referOpen]);
+
+  useEffect(() => {
+    const el = feeTiersDialogRef.current;
+    if (!el) return;
+    if (feeTiersOpen) {
+      if (!el.open) el.showModal();
+    } else if (el.open) {
+      el.close();
+    }
+  }, [feeTiersOpen]);
+
+  useEffect(() => {
+    const el = customExpiryDialogRef.current;
+    if (!el) return;
+    if (customExpiryOpen) {
+      if (!el.open) el.showModal();
+    } else if (el.open) {
+      el.close();
+    }
+  }, [customExpiryOpen]);
+
+  useEffect(() => {
+    const el = accountDialogRef.current;
+    if (!el) return;
+    if (accountOpen) {
+      if (!el.open) el.showModal();
+    } else if (el.open) {
+      el.close();
+    }
+  }, [accountOpen]);
+
+  useEffect(() => {
+    const el = referDialogRef.current;
+    if (!el) return;
+    if (referOpen) {
+      if (!el.open) el.showModal();
+    } else if (el.open) {
+      el.close();
+    }
+  }, [referOpen]);
+
+  // Persist `?r=` / `?ref=` / `?referrer=` for visitors before they connect.
+  useEffect(() => {
+    captureReferrerFromUrl();
+  }, []);
+
+  function openAccountDialog() {
+    setNickDraft(acct?.nickname?.trim() || "");
+    setEmailDraft(acct?.email?.trim() || "");
+    setEmailCodeDraft("");
+    setEmailVerifyPending(false);
+    setEmailResendAfter(0);
+    setOverlay("account");
+  }
+
+  function openReferDialog() {
+    setOverlay("refer");
+    if (!trader) {
+      setReferrals(null);
+      return;
+    }
+    setReferralsLoading(true);
+    api
+      .referrals(trader)
+      .then((r) => setReferrals(r))
+      .catch(() => setReferrals(null))
+      .finally(() => setReferralsLoading(false));
+  }
+
+  function openCustomExpiryDialog() {
+    const base =
+      (expiryChoice === "saved" && savedExpiry) ||
+      (expiryChoice === "custom" && appliedCustomExpiry) ||
+      savedExpiry ||
+      appliedCustomExpiry ||
+      defaultCustomExpiry();
+    setCustomDraft(base);
+    setCustomDraftSave(!!savedExpiry);
+    setOverlay("expiry");
+  }
+
+  function applyCustomExpiry() {
+    const next = { ...customDraft };
+    if (next.mode === "before_market" && next.beforeSecs < 0) {
+      toast.error("time before expiry must be ≥ 0");
+      return;
+    }
+    if (next.mode === "absolute") {
+      const minAt = Math.floor(Date.now() / 1000) + 60;
+      if (next.atUnix < minAt) {
+        toast.error("expiry must be at least 60s from now");
+        return;
+      }
+    }
+    if (customDraftSave) {
+      setSavedExpiry(next);
+      setAppliedCustomExpiry(next);
+      setExpiryChoice("saved");
+    } else {
+      setAppliedCustomExpiry(next);
+      setExpiryChoice("custom");
+    }
+    setOverlay(null);
+  }
 
   const patchChartMid = useCallback((midPx: number | null) => {
     if (midPx == null) return;
@@ -1278,22 +1892,44 @@ export function App() {
     }
   }, []);
 
+  const applyDefaultMarket = useCallback(
+    (ms: Market[], spot: number | null) => {
+      if (marketIdFromPath(window.location.pathname)) return;
+      const preferred =
+        pickDefaultMarket(ms, spot) || ms.find((x) => x.status === "Open") || ms[0];
+      if (!preferred) return;
+      const cur = marketIdRef.current;
+      if (cur && cur !== provisionalDefaultId.current) return;
+      if (preferred.id === cur) {
+        provisionalDefaultId.current = preferred.id;
+        return;
+      }
+      provisionalDefaultId.current = preferred.id;
+      setMarketsTab("hit");
+      setMarketsTf("daily");
+      setSide("Yes");
+      openMarket(preferred.id, "replace");
+    },
+    [openMarket]
+  );
+
   const applyMarkets = useCallback(
     (ms: Market[]) => {
       if (ms.length === 0) return;
       setMarkets(ms);
+      setQuotesById(quotesFromMarkets(ms));
       const fromUrl = marketIdFromPath(window.location.pathname);
-      const want = fromUrl || marketIdRef.current;
-      const liveOpen = ms.find((x) => x.status === "Open");
-      const m = ms.find((x) => x.id === want) || (!want ? liveOpen || ms[0] : undefined);
       if (!didInitFollow.current) didInitFollow.current = true;
-      const nextId = !m && liveOpen ? liveOpen.id : fromUrl && fromUrl !== marketIdRef.current ? fromUrl : m && !fromUrl ? m.id : null;
-      if (nextId && nextId !== marketIdRef.current) {
-        if (fromUrl && fromUrl === nextId) setMarketId(fromUrl);
-        else openMarket(nextId, "replace");
+      if (fromUrl) {
+        if (fromUrl !== marketIdRef.current) {
+          if (ms.some((x) => x.id === fromUrl)) openMarket(fromUrl, "replace");
+          else setMarketId(fromUrl);
+        }
+        return;
       }
+      applyDefaultMarket(ms, pxToUsd(spotRawRef.current));
     },
-    [openMarket]
+    [openMarket, applyDefaultMarket]
   );
 
   /** Upsert one market from WS `{ channel: market, op: "opened" }` (full list is not resent on open). */
@@ -1305,6 +1941,13 @@ export function App() {
       next[i] = m;
       return next;
     });
+    setQuotesById((prev) => ({
+      ...prev,
+      [m.id]: {
+        bid: typeof m.best_yes_bid === "number" ? m.best_yes_bid : null,
+        ask: typeof m.best_yes_ask === "number" ? m.best_yes_ask : null,
+      },
+    }));
   }, []);
 
   const mapLedgerTrades = useCallback((ledgerTrades: LedgerTrade[], ms: Market[]): MyFill[] => {
@@ -1361,15 +2004,20 @@ export function App() {
     return fills;
   }, []);
 
-  const applyClosedSnapshot = useCallback(
-    (closedTrades: LedgerTrade[]) => {
-      setClosedFills(mapLedgerTrades(closedTrades, marketsRef.current));
-    },
-    [mapLedgerTrades]
-  );
+  const resolveLedgerMarketId = useCallback((id: string, extra?: { market_id: string }[]) => {
+    const ms = marketsRef.current;
+    const hexRe = /^0x[0-9a-fA-F]{64}$/;
+    if (!hexRe.test(id)) return id;
+    const hashToSlug = new Map<string, string>();
+    for (const m of ms) hashToSlug.set(marketIdHash(m.id).toLowerCase(), m.id);
+    for (const p of extra || []) {
+      if (!hexRe.test(p.market_id)) hashToSlug.set(marketIdHash(p.market_id).toLowerCase(), p.market_id);
+    }
+    return hashToSlug.get(id.toLowerCase()) || id;
+  }, []);
 
   const applyLedgerSnapshot = useCallback(
-    (poss: LedgerPos[], ledgerTrades: LedgerTrade[], closedTrades?: LedgerTrade[]) => {
+    (poss: LedgerPos[], ledgerTrades: LedgerTrade[]) => {
       const ms = marketsRef.current;
       // Drop duplicate rows keyed by bytes32 hex when the slug row already exists.
       const hexRe = /^0x[0-9a-fA-F]{64}$/;
@@ -1410,19 +2058,81 @@ export function App() {
 
       setMyFills(mapLedgerTrades(ledgerTrades, ms));
       setPositions(rows);
-      if (closedTrades) {
-        setClosedFills(mapLedgerTrades(closedTrades, ms));
-      } else {
-        // Fallback until node sends `closed`: seller closes + redeems from trades.
-        setClosedFills(
-          mapLedgerTrades(
-            ledgerTrades.filter((t) => !!t.closing || t.op === "settle"),
-            ms
-          )
-        );
-      }
     },
     [mapLedgerTrades]
+  );
+
+  /** Match-time patch: merge new trades + upsert/remove positions without replacing history. */
+  const applyLedgerDelta = useCallback(
+    (
+      ledgerTrades: LedgerTrade[],
+      poss: LedgerPos[],
+      removes: { market_id: string; side: string }[]
+    ) => {
+      const ms = marketsRef.current;
+      if (ledgerTrades.length) {
+        const incoming = mapLedgerTrades(ledgerTrades, ms);
+        setMyFills((prev) => {
+          const rank = (s?: string) => (s === "confirmed" ? 0 : s === "pending" ? 1 : 2);
+          const keyOf = (r: MyFill) => `${r.id}:${r.marketId}:${r.side}:${r.op || "trade"}`;
+          const byKey = new Map<string, MyFill>();
+          for (const r of prev) byKey.set(keyOf(r), r);
+          for (const n of incoming) {
+            const k = keyOf(n);
+            const old = byKey.get(k);
+            if (!old) {
+              byKey.set(k, n);
+              continue;
+            }
+            // Never let a stale pending delta demote a receipt-confirmed History row.
+            if (rank(n.status) < rank(old.status)) {
+              byKey.set(k, { ...old, ...n });
+            } else if (rank(n.status) === rank(old.status)) {
+              byKey.set(k, {
+                ...old,
+                ...n,
+                txHash: (n.txHash || "").startsWith("0x") ? n.txHash : old.txHash,
+              });
+            } else if ((n.txHash || "").startsWith("0x") && !(old.txHash || "").startsWith("0x")) {
+              byKey.set(k, { ...old, txHash: n.txHash });
+            }
+          }
+          const merged = [...byKey.values()];
+          merged.sort((a, b) => b.ts - a.ts || (b.id ?? 0) - (a.id ?? 0));
+          return merged.slice(0, 500);
+        });
+      }
+      if (poss.length || removes.length) {
+        setPositions((prev) => {
+          const byKey = new Map(prev.map((p) => [`${p.marketId}:${p.side}`, p]));
+          for (const r of removes) {
+            const id = resolveLedgerMarketId(r.market_id, removes);
+            byKey.delete(`${id}:${r.side}`);
+          }
+          for (const p of poss) {
+            const id = resolveLedgerMarketId(p.market_id, poss);
+            const mkt = ms.find((x) => x.id === id);
+            byKey.set(`${id}:${p.side}`, {
+              marketId: id,
+              barrier: mkt?.barrier || byKey.get(`${id}:${p.side}`)?.barrier || "0",
+              side: p.side,
+              shares: p.shares,
+              usdc: p.usdc_staked,
+              redeemed: !!p.redeemed,
+            });
+          }
+          const rows = [...byKey.values()];
+          rows.sort((a, b) => {
+            const d = barrierKey({ barrier: b.barrier } as Market) - barrierKey({ barrier: a.barrier } as Market);
+            if (d > 0n) return 1;
+            if (d < 0n) return -1;
+            return a.marketId < b.marketId ? -1 : a.marketId > b.marketId ? 1 : a.side === b.side ? 0 : a.side === "Yes" ? -1 : 1;
+          });
+          return rows;
+        });
+      }
+    },
+    [mapLedgerTrades, resolveLedgerMarketId]
   );
 
   /** Wallet ledger only. Account is fetched separately and sparsely — it hits chain RPC. */
@@ -1433,26 +2143,24 @@ export function App() {
         setDbOrders([]);
         setPositions([]);
         setMyFills([]);
-        setClosedFills([]);
         setFunds([]);
         return;
       }
-      const [orders, ledgerTrades, poss, closed, cash] = await Promise.all([
+      const [orders, ledgerTrades, poss, cash] = await Promise.all([
         api.ledgerOrders(trader).catch(() => []),
-        api.ledgerTrades(trader).catch(() => []),
+        api.ledgerHistory(trader).catch(() => []),
         api.ledgerPositions(trader).catch(() => []),
-        api.ledgerClosed(trader).catch(() => [] as LedgerTrade[]),
         api.ledgerFunds(trader).catch(() => []),
       ]);
       setFunds(cash);
       setDbOrders(orders);
-      applyLedgerSnapshot(poss, ledgerTrades, closed);
+      applyLedgerSnapshot(poss, ledgerTrades);
     } catch (e: unknown) {
       const msg = String(e);
       if (e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(msg)) {
         setApiDown(true);
       } else {
-        setErr(msg);
+        toast.error(msg);
       }
     }
   }, [trader, applyLedgerSnapshot]);
@@ -1477,6 +2185,12 @@ export function App() {
     };
   }, []);
 
+  // Refine empty-path default once spot is known (closest daily hit-up barrier).
+  useEffect(() => {
+    if (!spotRaw || markets.length === 0) return;
+    applyDefaultMarket(markets, pxToUsd(spotRaw));
+  }, [spotRaw, markets, applyDefaultMarket]);
+
   useEffect(() => {
     const lasts: Record<string, number> = {};
     for (const m of markets) {
@@ -1490,10 +2204,14 @@ export function App() {
     setLastYes(lasts);
   }, [markets, mid, trades]);
 
+  // Coarse clock for pill colors / hour-minute expiry labels (not second countdowns).
   useEffect(() => {
-    const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
+    const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 30_000);
     return () => clearInterval(id);
   }, []);
+
+  const bookRef = useRef(book);
+  bookRef.current = book;
 
   // Yes mid for each open position market (mark-to-market).
   const posMarketIds = useMemo(
@@ -1514,7 +2232,7 @@ export function App() {
         ids.map(async (id) => {
           try {
             if (id === midRef.current) {
-              const live = yesMidCents(book);
+              const live = yesMidCents(bookRef.current);
               if (live != null) {
                 next[id] = live;
                 return;
@@ -1530,12 +2248,20 @@ export function App() {
       if (!stop) setPosMids(next);
     };
     load();
-    const t = setInterval(load, 2000);
+    const t = setInterval(load, 15_000);
     return () => {
       stop = true;
       clearInterval(t);
     };
-  }, [posMarketIds, book]);
+  }, [posMarketIds]);
+
+  // Keep the selected market's mark mid in sync with the live book without refetching.
+  useEffect(() => {
+    if (!mid) return;
+    const live = yesMidCents(book);
+    if (live == null) return;
+    setPosMids((prev) => (prev[mid] === live ? prev : { ...prev, [mid]: live }));
+  }, [book, mid]);
 
   // Wallet ledger when trader changes; not on a timer.
   useEffect(() => {
@@ -1547,6 +2273,27 @@ export function App() {
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
+
+  useEffect(() => {
+    if (!walletMenuOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const el = walletMenuRef.current;
+      if (el && e.target instanceof Node && !el.contains(e.target)) setWalletMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setWalletMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [walletMenuOpen]);
+
+  useEffect(() => {
+    setWalletMenuOpen(false);
+  }, [trader, isConnected]);
 
   // Chart mid history once per market/tf; current minute tip from book WS.
   useEffect(() => {
@@ -1587,9 +2334,34 @@ export function App() {
     };
   }, [mid, trader]);
 
+  // On wallet connect: attribute pending `?r=` referrer once (server keeps existing).
   useEffect(() => {
-    void refreshTradingEnabled();
-    // refreshTradingEnabled closes over latest cfg/trader/publicClient
+    if (!trader) return;
+    const ref = captureReferrerFromUrl();
+    if (!ref) return;
+    if (ref === trader.toLowerCase()) {
+      clearStoredReferrer();
+      return;
+    }
+    let stop = false;
+    api
+      .setReferrer({ trader, referrer: ref })
+      .then((r) => {
+        if (stop) return;
+        clearStoredReferrer();
+        setAcct((a) => (a ? { ...a, referrer: r.referrer } : a));
+      })
+      .catch(() => {
+        /* keep stored ref for a later retry */
+      });
+    return () => {
+      stop = true;
+    };
+  }, [trader]);
+
+  useEffect(() => {
+    refreshTradingEnabled();
+    // refreshTradingEnabled closes over latest cfg/trader
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [publicClient, cfg?.exchange, trader]);
 
@@ -1664,10 +2436,18 @@ export function App() {
           trader?: string;
           op?: string;
           amount?: number | string;
+          /** Absolute exchange balance (redeem / split / merge / fill / close). */
+          collateral?: number | string;
+          /** 30d weighted volume micro-USD (hourly snapshot). */
+          volume_30d?: number | string;
+          /** Taker fee coefficient for this wallet's volume tier. */
+          taker_coeff?: number | string;
+          /** Live taker gas fee (USDC raw) on `channel: config`. */
+          gas_fee?: number | string;
+          trading_fee_factor?: string;
           tx_hash?: string;
           positions?: LedgerPos[];
           trades?: LedgerTrade[];
-          closed?: LedgerTrade[];
           orders?: LedgerOrder[];
         };
         try {
@@ -1715,29 +2495,54 @@ export function App() {
               : v.best_yes_ask == null
                 ? null
                 : Number(v.best_yes_ask);
-          setMarkets((ms) =>
-            ms.map((m) =>
-              m.id === msgMarketId
-                ? {
-                    ...m,
-                    best_yes_bid: Number.isFinite(bid as number) ? (bid as number) : null,
-                    best_yes_ask: Number.isFinite(ask as number) ? (ask as number) : null,
-                  }
-                : m
-            )
-          );
+          const nextBid = Number.isFinite(bid as number) ? (bid as number) : null;
+          const nextAsk = Number.isFinite(ask as number) ? (ask as number) : null;
+          setQuotesById((prev) => {
+            const cur = prev[msgMarketId];
+            if (cur && cur.bid === nextBid && cur.ask === nextAsk) return prev;
+            return { ...prev, [msgMarketId]: { bid: nextBid, ask: nextAsk } };
+          });
           return;
         }
         if (v.channel === "price") {
           const raw = v.spot || (typeof v.price === "string" || typeof v.price === "number" ? String(v.price) : null);
-          if (raw) setSpotRaw(raw);
+          if (!raw) return;
+          // Binance ticks are ~10–20Hz; throttle UI spot so the whole tree does not re-render each tick.
+          const now = performance.now();
+          spotRawPendingRef.current = raw;
+          if (now - spotRawFlushAtRef.current < 250) {
+            if (spotRawTimerRef.current == null) {
+              spotRawTimerRef.current = setTimeout(() => {
+                spotRawTimerRef.current = null;
+                spotRawFlushAtRef.current = performance.now();
+                const pending = spotRawPendingRef.current;
+                if (pending) setSpotRaw(pending);
+              }, 250);
+            }
+            return;
+          }
+          spotRawFlushAtRef.current = now;
+          setSpotRaw(raw);
+          return;
+        }
+        if (v.channel === "config") {
+          const gas = typeof v.gas_fee === "number" ? v.gas_fee : Number(v.gas_fee);
+          setCfg((c) =>
+            c
+              ? {
+                  ...c,
+                  gas_fee: Number.isFinite(gas) ? gas : c.gas_fee,
+                  trading_fee_factor:
+                    typeof v.trading_fee_factor === "string" ? v.trading_fee_factor : c.trading_fee_factor,
+                }
+              : c
+          );
           return;
         }
         if (v.channel === "last_yes" && msgMarketId && v.price != null) {
           const px = typeof v.price === "number" ? v.price : Number(v.price);
           if (!(px > 0) || px >= 100) return;
-          setMarkets((ms) => ms.map((m) => (m.id === msgMarketId ? { ...m, last_yes_price: px } : m)));
-          setLastYes((m) => ({ ...m, [msgMarketId]: px }));
+          setLastYes((m) => (m[msgMarketId] === px ? m : { ...m, [msgMarketId]: px }));
           return;
         }
         if (v.channel === "tape_snapshot" && msgMarketId === id && Array.isArray(v.events)) {
@@ -1762,15 +2567,37 @@ export function App() {
           });
         } else if (v.channel === "tape" && v.event) {
           const e = v.event;
-          const em = tapeMarketId(e);
-          if (em && em !== id) return;
+          // History is cross-market — confirm before the selected-market tape filter.
           if (e.kind === "FillCommitted" && e.fill_id != null && e.tx_hash) {
             const fid = e.fill_id;
             const hash = e.tx_hash;
             setFillTx((m) => (m[fid] === hash ? m : { ...m, [fid]: hash }));
+            setMyFills((rows) =>
+              rows.map((r) =>
+                r.status === "pending" && Number(r.id) === Number(fid)
+                  ? { ...r, status: "confirmed", txHash: hash }
+                  : r
+              )
+            );
           }
+          const em = tapeMarketId(e);
+          if (em && em !== id) return;
         } else if (v.channel === "trades" && v.fill) {
           const f = v.fill;
+          // History is cross-market — promote pending legs even when viewing another market.
+          if (f.confirmed && (f.tx_hash || "").startsWith("0x")) {
+            setMyFills((rows) =>
+              rows.map((r) =>
+                r.status === "pending" &&
+                (Number(r.id) === Number(f.fill_id) ||
+                  (r.marketId === f.market_id &&
+                    Math.abs((r.ts || 0) - f.ts_engine) <= 2 &&
+                    Math.abs(Number(r.shares) - Number(f.size)) < 1e-9))
+                  ? { ...r, status: "confirmed", txHash: f.tx_hash }
+                  : r
+              )
+            );
+          }
           if (f.market_id && f.market_id !== id) return;
           setTrades((t) => {
             const i = t.findIndex((x) => x.fill_id === f.fill_id);
@@ -1781,35 +2608,57 @@ export function App() {
             }
             return [f, ...t].slice(0, 200);
           });
-          if (f.confirmed && (f.tx_hash || "").startsWith("0x")) {
-            setMyFills((rows) =>
-              rows.map((r) =>
-                r.status === "pending" &&
-                (r.id === f.fill_id ||
-                  (r.marketId === f.market_id &&
-                    Math.abs((r.ts || 0) - f.ts_engine) <= 2 &&
-                    Math.abs(Number(r.shares) - Number(f.size)) < 1e-9))
-                  ? { ...r, status: "confirmed", txHash: f.tx_hash }
-                  : r
-              )
-            );
-          }
         } else if (v.channel === "ledger" && v.trader && Array.isArray(v.positions) && Array.isArray(v.trades)) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
-          const closed = Array.isArray(v.closed) ? (v.closed as LedgerTrade[]) : undefined;
-          applyLedgerSnapshot(v.positions, v.trades, closed);
-        } else if (v.channel === "closed_positions" && v.trader && Array.isArray(v.closed)) {
+          applyLedgerSnapshot(v.positions, v.trades);
+        } else if (v.channel === "ledger_delta" && v.trader) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
-          applyClosedSnapshot(v.closed as LedgerTrade[]);
+          const trades = Array.isArray(v.trades) ? (v.trades as LedgerTrade[]) : [];
+          const positions = Array.isArray(v.positions) ? (v.positions as LedgerPos[]) : [];
+          const removes = Array.isArray((v as { remove_positions?: unknown }).remove_positions)
+            ? ((v as { remove_positions: { market_id: string; side: string }[] }).remove_positions)
+            : [];
+          applyLedgerDelta(trades, positions, removes);
         } else if (v.channel === "orders" && v.trader && Array.isArray(v.orders)) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
           setDbOrders(v.orders);
-        } else if (v.channel === "account" && v.trader && v.amount != null) {
+        } else if (v.channel === "account" && v.trader) {
           const me = traderRef.current?.toLowerCase();
           if (!me || String(v.trader).toLowerCase() !== me) return;
+          const volRaw =
+            v.volume_30d != null && Number.isFinite(Number(v.volume_30d)) ? Number(v.volume_30d) : undefined;
+          const coeffRaw =
+            v.taker_coeff != null && Number.isFinite(Number(v.taker_coeff)) && Number(v.taker_coeff) > 0
+              ? Number(v.taker_coeff)
+              : undefined;
+          const volPatch = {
+            ...(volRaw != null ? { volume_30d: volRaw } : null),
+            ...(coeffRaw != null ? { taker_coeff: coeffRaw } : null),
+          };
+          // Absolute balance after redeem / split / merge / fill / close (and post-fund refresh).
+          if (v.collateral != null) {
+            const coll = Number(v.collateral);
+            if (!Number.isFinite(coll) || coll < 0) return;
+            setAcct((a) => {
+              if (!a) return a;
+              const reserved = Number(a.reserved) || 0;
+              return {
+                ...a,
+                collateral: coll,
+                available: Math.max(0, coll - reserved),
+                ...volPatch,
+              };
+            });
+            return;
+          }
+          if ((volRaw != null || coeffRaw != null) && v.amount == null) {
+            setAcct((a) => (a ? { ...a, ...volPatch } : a));
+            return;
+          }
+          if (v.amount == null) return;
           const tx = String(v.tx_hash || "").toLowerCase();
           if (tx) {
             if (acctFundTxRef.current.has(tx)) return;
@@ -1818,12 +2667,18 @@ export function App() {
           const amt = Number(v.amount);
           if (!Number.isFinite(amt) || amt <= 0) return;
           const op = String(v.op || "deposit");
+          if (op !== "deposit" && op !== "withdraw") return;
           const delta = op === "withdraw" ? -amt : amt;
           setAcct((a) => {
             if (!a) return a;
             const coll = Math.max(0, Number(a.collateral) + delta);
             const avail = Math.max(0, Number(a.available) + delta);
-            return { ...a, collateral: coll, available: avail };
+            return {
+              ...a,
+              collateral: coll,
+              available: avail,
+              ...volPatch,
+            };
           });
           setFunds((rows) => {
             if (tx && rows.some((r) => (r.tx_hash || "").toLowerCase() === tx && r.status === "confirmed")) {
@@ -1849,10 +2704,14 @@ export function App() {
     return () => {
       stop = true;
       if (timer) clearTimeout(timer);
+      if (spotRawTimerRef.current) {
+        clearTimeout(spotRawTimerRef.current);
+        spotRawTimerRef.current = null;
+      }
       wsRef.current = null;
       sock?.close();
     };
-  }, [applyBook, applyMarkets, upsertMarket, applyLedgerSnapshot, applyClosedSnapshot]);
+  }, [applyBook, applyMarkets, upsertMarket, applyLedgerSnapshot, applyLedgerDelta]);
 
   useEffect(() => {
     bookSeqRef.current = -1;
@@ -1866,11 +2725,6 @@ export function App() {
     ws.send(JSON.stringify({ op: "subscribe", channel: "trades", market: mid }));
     ws.send(JSON.stringify({ op: "subscribe", channel: "resolved", market: mid }));
   }, [mid]);
-
-  useEffect(() => {
-    if (!publicClient || !cfg || !trader) return;
-    publicClient.readContract({ address: cfg.usdc, abi: usdcAbi, functionName: "balanceOf", args: [trader] }).then(setWalletUsdc);
-  }, [publicClient, cfg, trader, acct]);
 
   async function ensureHardhat() {
     const want = cfg?.chain_id ?? localChain.id;
@@ -1904,98 +2758,245 @@ export function App() {
     return w.signTypedData({ account: trader, domain: dom, types, primaryType, message });
   }
 
-  /** EIP-712 Order: prefer the authorized wallet when Enable Trading is active. */
-  async function signOrder(message: Record<string, unknown>): Promise<Hex> {
+  async function signPersonalAsUser(message: string): Promise<Hex> {
+    if (!trader) throw new Error("wallet not ready");
+    await ensureHardhat();
+    const w = await getWalletClient(config, { chainId: localChain.id });
+    if (!w) throw new Error(`wallet not on ${localChain.name} (${localChain.id})`);
+    return w.signMessage({ account: trader, message });
+  }
+
+  async function saveNickname() {
+    if (!cfg || !trader) return;
+    const nickname = nickDraft.trim();
+    if (nickname.length < 3 || nickname.length > 24) {
+      toast.error("Nickname must be 3–24 characters");
+      return;
+    }
+    if (!/^[A-Za-z0-9_]+$/.test(nickname)) {
+      toast.error("Nickname: letters, digits, underscore only");
+      return;
+    }
+    setAccountBusy(true);
+    try {
+      const nonce = Date.now();
+      const message = setNicknameMessage(trader as Address, nickname, nonce, cfg.chain_id);
+      const signature = await signPersonalAsUser(message);
+      const r = await api.setNickname({ trader, nickname, nonce, signature });
+      setAcct((a) => (a ? { ...a, nickname: r.nickname } : a));
+      toast.success("Nickname saved");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function saveEmail() {
+    if (!cfg || !trader) return;
+    const email = emailDraft.trim().toLowerCase();
+    if (!email.includes("@") || email.length < 5) {
+      toast.error("Enter a valid email");
+      return;
+    }
+    setAccountBusy(true);
+    try {
+      const nonce = Date.now();
+      const message = setEmailMessage(trader as Address, email, nonce, cfg.chain_id);
+      const signature = await signPersonalAsUser(message);
+      const r = await api.setEmail({ trader, email, nonce, signature });
+      setAcct((a) =>
+        a ? { ...a, email: r.email, email_verified: false } : a
+      );
+      setEmailDraft(r.email);
+      setEmailCodeDraft("");
+      setEmailVerifyPending(true);
+      if (r.resend_after) setEmailResendAfter(r.resend_after);
+      if (r.email_sent) {
+        toast.success("Verification code sent — check your email");
+      } else if (r.verification_code) {
+        toast.info(`Enter verification code ${r.verification_code}`);
+      } else {
+        toast.success("Check your email for the verification code");
+      }
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function submitEmailCode() {
+    if (!trader) return;
+    const code = emailCodeDraft.trim();
+    if (!/^\d{6}$/.test(code)) {
+      toast.error("Enter the 6-digit code");
+      return;
+    }
+    setAccountBusy(true);
+    try {
+      const r = await api.verifyEmail({ trader, code });
+      setAcct((a) =>
+        a ? { ...a, email: r.email, email_verified: true } : a
+      );
+      setEmailVerifyPending(false);
+      setEmailCodeDraft("");
+      toast.success("Email verified");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function resendEmailCode() {
+    if (!cfg || !trader) return;
+    // Must match the pending address on the node (not an unsaved draft).
+    const email = (acct?.email || "").trim().toLowerCase();
+    if (!email.includes("@") || acct?.email_verified) {
+      toast.error("Save an email first");
+      return;
+    }
+    setAccountBusy(true);
+    try {
+      const nonce = Date.now();
+      const message = resendEmailCodeMessage(trader as Address, email, nonce, cfg.chain_id);
+      const signature = await signPersonalAsUser(message);
+      const r = await api.resendEmailCode({ trader, nonce, signature });
+      setEmailDraft(r.email);
+      setEmailCodeDraft("");
+      setEmailVerifyPending(true);
+      setAcct((a) => (a ? { ...a, email: r.email, email_verified: false } : a));
+      if (r.resend_after) setEmailResendAfter(r.resend_after);
+      if (r.email_sent) {
+        toast.success("Verification code resent — check your email");
+      } else if (r.verification_code) {
+        toast.info(`Enter verification code ${r.verification_code}`);
+      } else {
+        toast.success("Check your email for the verification code");
+      }
+    } catch (e) {
+      const msg = String(e);
+      const m = msg.match(/retry in (\d+)s/i);
+      if (m) setEmailResendAfter(Math.floor(Date.now() / 1000) + Number(m[1]));
+      toast.error(msg);
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  /** EIP-712 typed data: prefer the session key when 1-click trading is active. */
+  async function signSessionOrUser(
+    types: Record<string, readonly { name: string; type: string }[]>,
+    primaryType: string,
+    message: Record<string, unknown>,
+  ): Promise<Hex> {
     if (!cfg || !trader) throw new Error("wallet/rpc not ready");
     const wallet = loadTradingAccount(trader as Address);
     if (tradingEnabled && wallet) {
       const dom = domain(cfg.chain_id, cfg.exchange);
       return wallet.signTypedData({
         domain: dom,
-        types: orderTypes,
-        primaryType: "Order",
+        types,
+        primaryType,
         message: message as never,
       });
     }
-    return signAsUser(orderTypes, "Order", message);
+    return signAsUser(types, primaryType, message);
   }
 
-  async function refreshTradingEnabled() {
-    if (!publicClient || !cfg || !trader) {
+  /** EIP-712 Order: prefer the authorized wallet when Enable Trading is active. */
+  async function signOrder(message: Record<string, unknown>): Promise<Hex> {
+    return signSessionOrUser(orderTypes, "Order", message);
+  }
+
+  function sessionAgentAuth():
+    | {
+        arizal_chain: string;
+        agent_address: string;
+        nonce: number;
+        expires_at: number;
+        signature: `0x${string}`;
+      }
+    | undefined {
+    if (!trader || !tradingEnabled || !loadTradingAccount(trader as Address)) return undefined;
+    const auth = loadAgentAuth(trader as Address);
+    if (!auth) throw new Error("1-click session expired — enable trading again");
+    return {
+      arizal_chain: auth.arizal_chain,
+      agent_address: auth.agent_address,
+      nonce: auth.nonce,
+      expires_at: auth.expires_at,
+      signature: auth.signature,
+    };
+  }
+
+  function arizalChainLabel(): string {
+    if (cfg?.chain_id === 31337) return "Local";
+    if (cfg?.chain_id === 421614) return "Testnet";
+    return "Mainnet";
+  }
+
+  function refreshTradingEnabled() {
+    if (!cfg || !trader) {
       setTradingEnabled(false);
       return;
     }
     const wallet = loadTradingAccount(trader as Address);
-    if (!wallet) {
-      setTradingEnabled(false);
-      return;
-    }
-    try {
-      const [onChain, expiresAt] = await Promise.all([
-        publicClient.readContract({
-          address: cfg.exchange,
-          abi: exchangeAbi,
-          functionName: "authorizedWallet",
-          args: [trader as Address],
-        }) as Promise<Address>,
-        publicClient.readContract({
-          address: cfg.exchange,
-          abi: exchangeAbi,
-          functionName: "authorizedWalletExpires",
-          args: [trader as Address],
-        }) as Promise<bigint>,
-      ]);
-      const now = BigInt(Math.floor(Date.now() / 1000));
-      setTradingEnabled(
-        onChain.toLowerCase() === wallet.address.toLowerCase() && expiresAt > now,
-      );
-    } catch {
-      setTradingEnabled(false);
-    }
+    const auth = loadAgentAuth(trader as Address);
+    setTradingEnabled(
+      !!wallet &&
+        !!auth &&
+        auth.agent_address.toLowerCase() === wallet.address.toLowerCase() &&
+        auth.expires_at > Math.floor(Date.now() / 1000),
+    );
   }
 
   async function enableTrading() {
     if (!cfg || !trader) return;
-    setErr("");
     try {
       await ensureHardhat();
       let wallet = loadTradingAccount(trader as Address);
       if (!wallet) wallet = createTradingAccount(trader as Address);
-      const expiresAt = BigInt(Math.floor(Date.now() / 1000) + 24 * 60 * 60);
-      await writeAsUser({
-        chainId: localChain.id,
-        address: cfg.exchange,
-        abi: exchangeAbi,
-        functionName: "authorizeSession",
-        args: [wallet.address, expiresAt],
-        nonce: await latestNonce(),
+      const expiresAt = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
+      const nonce = Date.now();
+      const msg = {
+        arizalChain: arizalChainLabel(),
+        agentAddress: wallet.address,
+        nonce: BigInt(nonce),
+        expiresAt: BigInt(expiresAt),
+      };
+      const signature = await signAsUser(
+        {
+          ApproveAgent: [
+            { name: "arizalChain", type: "string" },
+            { name: "agentAddress", type: "address" },
+            { name: "nonce", type: "uint64" },
+            { name: "expiresAt", type: "uint64" },
+          ],
+        },
+        "ApproveAgent",
+        msg,
+      );
+      saveAgentAuth(trader as Address, {
+        arizal_chain: msg.arizalChain,
+        agent_address: wallet.address,
+        nonce,
+        expires_at: expiresAt,
+        signature: signature as `0x${string}`,
       });
       setTradingEnabled(true);
-      setMsg(`trading enabled · 24h · ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}`);
+      toast.success("1-Click trading enabled");
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
-  async function disableTrading() {
-    if (!cfg || !trader) return;
-    setErr("");
-    try {
-      await ensureHardhat();
-      await writeAsUser({
-        chainId: localChain.id,
-        address: cfg.exchange,
-        abi: exchangeAbi,
-        functionName: "authorizeSession",
-        args: [zeroAddress, 0n],
-        nonce: await latestNonce(),
-      });
-      clearTradingAccount(trader as Address);
-      setTradingEnabled(false);
-      setMsg("trading disabled");
-    } catch (e: unknown) {
-      setErr(explainErr(e));
-    }
+  function disableTrading() {
+    if (!trader) return;
+    clearTradingAccount(trader as Address);
+    setTradingEnabled(false);
+    toast.success("1-Click trading disabled");
   }
 
   function explainErr(e: unknown): string {
@@ -2009,10 +3010,26 @@ export function App() {
     if (localChain.id === 31337 && /nonce too high|nonce too low/i.test(s)) {
       return `${s} — Hardhat reset the chain nonce. In MetaMask (Hardhat Local): Settings → Advanced → Clear activity tab data, then retry.`;
     }
-    if (/insufficient collateral/i.test(s)) {
-      return "insufficient collateral — orders spend USDC deposited in the exchange, not the wallet balance. Faucet 1000, then deposit.";
+    if (/insufficient (collateral|balance)/i.test(s)) {
+      return "insufficient balance — orders spend USDC deposited in the exchange, not the wallet balance. Faucet 1000, then deposit.";
     }
     return s;
+  }
+
+  /** Friendly toasts for place / close order failures; append backend body when present. */
+  function placeOrderErrorMessage(e: unknown): string {
+    const detail = (e instanceof Error ? e.message : String(e)).replace(/^Error:\s*/i, "").trim();
+    if (/insufficient (collateral|balance)/i.test(detail)) return "Insufficient balance — deposit USDC first";
+    if (/user rejected|user denied|rejected the request/i.test(detail)) return "Order cancelled";
+    if (/GTD expires_at|expires_at must/i.test(detail)) return "Order expiry must be at least 1 minute from now";
+    if (/market expiry unknown/i.test(detail)) return "Market expiry unknown — pick a date and time instead";
+    if (/wallet\/rpc not ready|wallet not on/i.test(detail)) return "Connect your wallet and switch to the right network";
+    if (/failed to fetch|networkerror|load failed/i.test(detail)) return "Failed to send order — network error";
+    // Huge wallet/RPC dumps stay generic; short API bodies (e.g. POST /v1/orders) are shown.
+    if (detail && detail.length <= 240 && !/UserOperation|TransactionExecutionError|Details: hex/i.test(detail)) {
+      return `Failed to send order — ${detail}`;
+    }
+    return "Failed to send order";
   }
 
   async function latestNonce(): Promise<number> {
@@ -2034,19 +3051,17 @@ export function App() {
   /** Operator sends 10 Hardhat ETH + 1000 mock USDC to the connected wallet (not the exchange). */
   async function faucet() {
     if (!trader) return;
-    setErr("");
     try {
       const r = await api.faucet(trader);
-      setMsg(`faucet 10 ETH + 1000 USDC → wallet · eth ${shortTx(r.eth_tx_hash)} · usdc ${shortTx(r.usdc_tx_hash)}`);
+      toast.success(`faucet 10 ETH + 1000 USDC → wallet · eth ${shortTx(r.eth_tx_hash)} · usdc ${shortTx(r.usdc_tx_hash)}`);
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
   async function deposit() {
     if (!cfg) return;
-    setErr("");
     try {
       await ensureHardhat();
       const amt = parseUnits(dwAmt || "0", 6);
@@ -2067,16 +3082,15 @@ export function App() {
         nonce: await latestNonce(),
       });
       await markPending("deposit", amt, dep);
-      setMsg("deposited");
+      toast.success(`Successfully deposited $${Number(formatUnits(amt, 6)).toFixed(2)} USDC`);
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
   async function withdraw() {
     if (!cfg) return;
-    setErr("");
     try {
       await ensureHardhat();
       const amt = parseUnits(dwAmt || "0", 6);
@@ -2089,17 +3103,16 @@ export function App() {
         nonce: await latestNonce(),
       });
       await markPending("withdraw", amt, wd);
-      setMsg("withdrawn");
+      toast.success(`Successfully withdrew $${Number(formatUnits(amt, 6)).toFixed(2)} USDC`);
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
   async function redeem(marketId?: string) {
     const id = marketId || mid;
     if (!cfg || !id) return;
-    setErr("");
     try {
       await ensureHardhat();
       await writeAsUser({
@@ -2111,10 +3124,10 @@ export function App() {
         nonce: await latestNonce(),
       });
       setSettledLocal((s) => new Set(s).add(id));
-      setMsg("redeemed");
+      toast.success("redeemed");
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
@@ -2124,19 +3137,24 @@ export function App() {
     price: number;
     size: string;
     tif: Tif;
+    expiresAt: number;
     market: boolean;
     close?: boolean;
+    postOnly?: boolean;
   }) {
     if (!cfg || !trader) return;
-    setErr("");
+    if (placePhaseRef.current === "placing") return;
     const pxCents = opts.market ? (opts.close ? 0 : 99) : opts.price;
     const px = opts.market ? (opts.close ? 0 : MAX_DECICENTS) : centsToDecicents(opts.price);
     const useTif: Tif = opts.market ? "FAK" : opts.tif;
+    const orderType = !opts.market && !opts.close && opts.postOnly ? "PostOnly" : "Limit";
+    placePhaseRef.current = "placing";
+    setPlacePhase("placing");
     try {
       await ensureHardhat();
       const nowSec = Math.floor(Date.now() / 1000);
       const minGtd = nowSec + (cfg.gtd_min_secs ?? 60);
-      if (useTif === "GTD" && expiresAt < minGtd) {
+      if (useTif === "GTD" && opts.expiresAt < minGtd) {
         throw new Error(`GTD expires_at must be unix seconds ≥ ${minGtd} (now+60s)`);
       }
       // Buys soft-lock USDC only for this market + Yes/No side (same deposit can cover every market).
@@ -2148,10 +3166,14 @@ export function App() {
           if (!Number.isFinite(rem)) return sum;
           return sum + Math.floor((rem * 1_000_000 * o.price) / 1000);
         }, 0);
+      // Post-only rests only (maker); backend allows gas_fee 0.
+      const gasFee =
+        orderType === "PostOnly" ? 0 : Math.max(0, Math.floor(Number(cfg.gas_fee ?? 0)));
       const have = (acct?.collateral ?? 0) - sideReserved;
-      if (!opts.close && acct && have < need) {
+      const needWithGas = need + (opts.close ? 0 : gasFee);
+      if (!opts.close && acct && have < needWithGas) {
         throw new Error(
-          `insufficient collateral: need ${(need / 1e6).toFixed(2)} USDC on this market side, have ${(Math.max(0, have) / 1e6).toFixed(2)}`
+          `insufficient balance: need ${(needWithGas / 1e6).toFixed(2)} USDC on this market side, have ${(Math.max(0, have) / 1e6).toFixed(2)}`
         );
       }
       const order: SignedOrder = {
@@ -2160,27 +3182,45 @@ export function App() {
         side: opts.side,
         price: px,
         size: opts.size,
-        order_type: "Limit",
+        order_type: orderType,
         tif: useTif,
         nonce: Date.now(),
         salt: Math.floor(Math.random() * 1e12),
-        expires_at: useTif === "GTD" ? expiresAt : 0,
+        expires_at: useTif === "GTD" ? opts.expiresAt : 0,
+        gas_fee: gasFee,
         chain_id: cfg.chain_id,
         verifying_contract: cfg.exchange,
       };
       const signature = await signOrder(orderMessage(order));
-      const r = await api.place({ order, signature, close: opts.close || undefined });
+      const r = await api.place({
+        order,
+        signature,
+        agent_auth: sessionAgentAuth(),
+        close: opts.close || undefined,
+      });
       if ((r.fills?.length ?? 0) === 0 && r.reason) {
-        const why = r.reason === "fak remainder"
-          ? `no ${opts.side.toUpperCase()} bid at or above ${pxCents || "market"}¢`
-          : r.reason;
-        setErr(`order #${r.order_id} cancelled: ${why}`);
+        const why =
+          r.reason === "fak remainder"
+            ? opts.close || opts.market
+              ? "no matching liquidity"
+              : `no ${opts.side.toUpperCase()} liquidity at ${pxCents}¢`
+            : r.reason === "post-only"
+              ? "would take liquidity (post-only)"
+              : r.reason === "self-trade"
+                ? "self-trade blocked"
+                : "could not rest on the book";
+        toast.error(`Order cancelled — ${why}`);
+      } else if (opts.close) {
+        toast.success("Successfully closed position");
       } else {
-        setMsg(`order #${r.order_id} ${r.status}`);
+        toast.success("Successfully placed order");
       }
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(placeOrderErrorMessage(e));
+    } finally {
+      placePhaseRef.current = "idle";
+      setPlacePhase("idle");
     }
   }
 
@@ -2188,25 +3228,49 @@ export function App() {
     if (!mid) return;
     if (entryKind === "merge") return mergePos(mid, size);
     if (entryKind === "split") return splitPos(mid, size);
-    return submitOrder({
-      marketId: mid,
-      side,
-      price,
-      size,
-      tif,
-      market: entryKind === "market",
-      close: intent === "sell",
-    });
+    if (entryKind === "market") {
+      return submitOrder({
+        marketId: mid,
+        side,
+        price,
+        size,
+        tif: "FAK",
+        expiresAt: 0,
+        market: true,
+        close: intent === "sell",
+      });
+    }
+    try {
+      const resolved = resolveLimitExpiry(
+        expiryChoice,
+        appliedCustomExpiry,
+        savedExpiry,
+        market?.expires_at,
+        Math.floor(Date.now() / 1000)
+      );
+      return submitOrder({
+        marketId: mid,
+        side,
+        price,
+        size,
+        tif: resolved.tif,
+        expiresAt: resolved.expiresAt,
+        market: false,
+        close: intent === "sell",
+        postOnly: intent === "buy" && postOnly,
+      });
+    } catch (e: unknown) {
+      toast.error(placeOrderErrorMessage(e));
+    }
   }
 
   async function splitPos(marketId: string, sizeStr: string) {
     if (!cfg || !trader) return;
-    setErr("");
     try {
       const raw = parseUnits(sizeStr || "0", 6);
       if (raw <= 0n) throw new Error("size required");
       if (acct && BigInt(acct.available) < raw) {
-        throw new Error(`insufficient collateral: split needs ${sizeStr} USDC deposited`);
+        throw new Error(`insufficient balance: split needs ${sizeStr} USDC deposited`);
       }
       await ensureHardhat();
       const tx = await writeAsUser({
@@ -2218,16 +3282,15 @@ export function App() {
         nonce: await latestNonce(),
       });
       await markPending("split", raw, tx, marketId);
-      setMsg(`split ${sizeStr} submitted`);
+      toast.success(`split ${sizeStr} submitted`);
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
   async function mergePos(marketId: string, sizeStr?: string) {
     if (!cfg || !trader) return;
-    setErr("");
     try {
       const yes = positions.find((p) => p.marketId === marketId && p.side === "Yes");
       const no = positions.find((p) => p.marketId === marketId && p.side === "No");
@@ -2247,10 +3310,10 @@ export function App() {
         nonce: await latestNonce(),
       });
       await markPending("merge", raw, tx, marketId);
-      setMsg(`merge ${n} submitted`);
+      toast.success(`merge ${n} submitted`);
       refresh();
     } catch (e: unknown) {
-      setErr(explainErr(e));
+      toast.error(explainErr(e));
     }
   }
 
@@ -2261,6 +3324,7 @@ export function App() {
       price: 0,
       size: String(p.shares),
       tif: "FAK",
+      expiresAt: 0,
       market: false,
       close: true,
     });
@@ -2268,52 +3332,61 @@ export function App() {
 
   async function cancel(id: number, marketId: string) {
     if (!cfg || !trader || !marketId) return;
-    setErr("");
     try {
       await ensureHardhat();
       const nonce = Date.now();
-      const signature = await signAsUser(cancelTypes, "Cancel", {
+      const signature = await signSessionOrUser(cancelTypes, "Cancel", {
         trader,
         orderId: BigInt(id),
         marketId,
         nonce: BigInt(nonce),
       });
-      await api.cancel(id, { trader, market_id: marketId, nonce, signature });
+      await api.cancel(id, {
+        trader,
+        market_id: marketId,
+        nonce,
+        signature,
+        agent_auth: sessionAgentAuth(),
+      });
       refresh();
     } catch (e: unknown) {
-      setErr(String(e));
+      toast.error(String(e));
     }
   }
 
   async function cancelAll() {
     if (!cfg || !trader) return;
-    setErr("");
     try {
       await ensureHardhat();
       const nonce = Date.now();
-      const signature = await signAsUser(cancelAllTypes, "CancelAll", {
+      const signature = await signSessionOrUser(cancelAllTypes, "CancelAll", {
         trader,
         marketId: cancelAllMarketId(),
         nonce: BigInt(nonce),
       });
-      const r = await api.cancelAll({ trader, nonce, signature });
-      setMsg(`cancelled ${r.count}`);
+      const r = await api.cancelAll({
+        trader,
+        nonce,
+        signature,
+        agent_auth: sessionAgentAuth(),
+      });
+      toast.success(`cancelled ${r.count}`);
       refresh();
     } catch (e: unknown) {
-      setErr(String(e));
+      toast.error(String(e));
     }
   }
 
-  const history = useMemo(
-    () =>
-      [...markets].sort((a, b) => {
-        const d = barrierKey(b) - barrierKey(a);
-        if (d > 0n) return 1;
-        if (d < 0n) return -1;
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-      }),
-    [markets]
-  );
+  // Sort only while the markets dropdown is open — avoid O(n log n) on every quote/price tick.
+  const history = useMemo(() => {
+    if (!marketsOpen) return markets;
+    return [...markets].sort((a, b) => {
+      const d = barrierKey(b) - barrierKey(a);
+      if (d > 0n) return 1;
+      if (d < 0n) return -1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+  }, [markets, marketsOpen]);
   const invertSide = side === "No";
   const chartPts = useMemo(() => {
     const raw = (chart?.points || [])
@@ -2324,36 +3397,585 @@ export function App() {
       .filter((x): x is { t: number; p: number } => x != null);
     return invertSide ? raw.map((pt) => ({ t: pt.t, p: 100 - pt.p })) : raw;
   }, [chart, invertSide]);
+  /** Open orders for this market, priced in the chart's Y units (Yes mid or inverted No). */
+  const chartOrderLines = useMemo(() => {
+    const byKey = new Map<string, { price: number; side: Side; rem: number }>();
+    for (const o of dbOrders) {
+      if (o.market_id !== mid) continue;
+      if (!isOpenOrderStatus(o.status)) continue;
+      const rem = Number(o.remaining);
+      if (!(rem > 0)) continue;
+      const sidePx = decicentsToCents(o.price);
+      if (!Number.isFinite(sidePx)) continue;
+      // Chart Y is Yes¢, or No¢ when inverted — map each order into that frame.
+      const chartPx = invertSide
+        ? o.side === "No"
+          ? sidePx
+          : 100 - sidePx
+        : o.side === "Yes"
+          ? sidePx
+          : 100 - sidePx;
+      if (!(chartPx > 0) || !(chartPx < 100)) continue;
+      const key = `${o.side}:${chartPx.toFixed(1)}`;
+      const prev = byKey.get(key);
+      if (prev) prev.rem += rem;
+      else byKey.set(key, { price: chartPx, side: o.side, rem });
+    }
+    return [...byKey.values()].sort((a, b) => b.price - a.price);
+  }, [dbOrders, mid, invertSide]);
   return (
     <>
-      <header>
-        <span className="brand">arizal<span>.xyz</span></span>
-        <a className="docs" href="/docs.html">docs</a>
-        {(apiDown || wsDown) && <span className="conn-down">connection failed, reconnecting</span>}
-        <div className="connect">
-          {isConnected ? (
-            <>
-              <span className="sha">{trader?.slice(0, 6)}…{trader?.slice(-4)}</span>{" "}
-              {onHardhat ? (
-                <span className="ok">{localChain.name} {localChain.id}</span>
-              ) : (
-                <button className="no" onClick={() => ensureHardhat().catch((e) => setErr(String(e)))}>
-                  switch to {localChain.name} (now chain {walletChainId ?? "?"})
-                </button>
-              )}{" "}
-              <button onClick={() => disconnect()}>disconnect</button>
-            </>
+      <ToastContainer
+        position="bottom-right"
+        theme="dark"
+        autoClose={4000}
+        newestOnTop
+        closeOnClick
+        pauseOnHover
+        style={{ zIndex: 2147483647 }}
+      />
+      <dialog
+        ref={customExpiryDialogRef}
+        className="custom-expiry-dialog"
+        onClose={() => setOverlay(null)}
+        onPointerDown={onDialogBackdropPointerDown}
+        onClick={onDialogBackdropClick}
+      >
+        <div className="custom-expiry-panel">
+          <header className="fee-tiers-head">
+            <h2>Custom Expiry</h2>
+            <button
+              type="button"
+              className="fee-tiers-close"
+              aria-label="Close"
+              onClick={() => setOverlay(null)}
+            >
+              ×
+            </button>
+          </header>
+          <div className="custom-expiry-modes" role="tablist" aria-label="Expiry mode">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={customDraft.mode === "before_market"}
+              className={customDraft.mode === "before_market" ? "on" : undefined}
+              onClick={() => setCustomDraft((d) => ({ ...d, mode: "before_market" }))}
+            >
+              Before expiry
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={customDraft.mode === "absolute"}
+              className={customDraft.mode === "absolute" ? "on" : undefined}
+              onClick={() => setCustomDraft((d) => ({ ...d, mode: "absolute" }))}
+            >
+              Date &amp; time
+            </button>
+          </div>
+          {customDraft.mode === "before_market" ? (
+            <div className="custom-expiry-body">
+              <p className="fee-tiers-note">
+                Cancel the order this long before expiry
+                {market?.expires_at
+                  ? ` (${new Date(market.expires_at * 1000).toLocaleString()})`
+                  : ""}
+                .
+              </p>
+              <div className="row">
+                <div className="field">
+                  <label>hours</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={Math.floor(customDraft.beforeSecs / 3600)}
+                    onChange={(e) => {
+                      const h = Math.max(0, Math.floor(Number(e.target.value) || 0));
+                      const m = Math.floor((customDraft.beforeSecs % 3600) / 60);
+                      setCustomDraft((d) => ({ ...d, beforeSecs: h * 3600 + m * 60 }));
+                    }}
+                    onWheel={(e) => e.currentTarget.blur()}
+                  />
+                </div>
+                <div className="field">
+                  <label>minutes</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    step={1}
+                    value={Math.floor((customDraft.beforeSecs % 3600) / 60)}
+                    onChange={(e) => {
+                      const m = Math.min(59, Math.max(0, Math.floor(Number(e.target.value) || 0)));
+                      const h = Math.floor(customDraft.beforeSecs / 3600);
+                      setCustomDraft((d) => ({ ...d, beforeSecs: h * 3600 + m * 60 }));
+                    }}
+                    onWheel={(e) => e.currentTarget.blur()}
+                  />
+                </div>
+              </div>
+              {market?.expires_at ? (
+                <p className="sha custom-expiry-preview">
+                  Order expires{" "}
+                  {new Date((market.expires_at - customDraft.beforeSecs) * 1000).toLocaleString()}
+                </p>
+              ) : null}
+            </div>
           ) : (
-            connectors.map((c) => (
-              <button
-                key={c.uid}
-                className="primary"
-                onClick={() => connect({ connector: c, chainId: localChain.id })}
-              >
-                connect {c.name}
-              </button>
-            ))
+            <div className="custom-expiry-body">
+              <p className="fee-tiers-note">Pick the date and time the order should expire.</p>
+              <div className="field">
+                <label>expires at</label>
+                <input
+                  type="datetime-local"
+                  value={toDatetimeLocalValue(customDraft.atUnix || Math.floor(Date.now() / 1000) + 3600)}
+                  onChange={(e) => {
+                    const at = fromDatetimeLocalValue(e.target.value);
+                    if (at > 0) setCustomDraft((d) => ({ ...d, atUnix: at }));
+                  }}
+                />
+              </div>
+            </div>
           )}
+          <label className="custom-expiry-save">
+            <input
+              type="checkbox"
+              checked={customDraftSave}
+              onChange={(e) => setCustomDraftSave(e.target.checked)}
+            />
+            Save this option in the expires dropdown
+          </label>
+          <div className="custom-expiry-actions">
+            <button type="button" onClick={() => setOverlay(null)}>
+              Cancel
+            </button>
+            <button type="button" className="primary" onClick={applyCustomExpiry}>
+              Apply
+            </button>
+          </div>
+        </div>
+      </dialog>
+      <dialog
+        ref={referDialogRef}
+        className="account-dialog refer-dialog"
+        onClose={() => setOverlay(null)}
+        onPointerDown={onDialogBackdropPointerDown}
+        onClick={onDialogBackdropClick}
+      >
+        <div className="account-panel">
+          <header className="fee-tiers-head">
+            <h2>Refer & Earn</h2>
+            <button
+              type="button"
+              className="fee-tiers-close"
+              aria-label="Close"
+              onClick={() => setOverlay(null)}
+            >
+              ×
+            </button>
+          </header>
+          <p className="fee-tiers-note">
+            Share your link. When someone connects with it, they are attributed to your wallet.
+          </p>
+          <p className="fee-tiers-note">
+            Referred volume is <strong>weighted</strong> the same way as fee volume:{" "}
+            <code>shares × p × (1 − p)</code>, where <code>p</code> is the fill price in dollars
+            (so weight is <code>p × (100 − p)</code> when price is in ¢). It peaks at 50¢ and is
+            symmetric (30¢ = 70¢).
+          </p>
+          <div className="field">
+            <label>your referral link</label>
+            <div className="refer-link-row">
+              <input
+                readOnly
+                value={trader ? referralLinkFor(trader) : ""}
+                aria-label="Referral link"
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <button
+                type="button"
+                className="primary"
+                disabled={!trader}
+                onClick={async () => {
+                  if (!trader) return;
+                  try {
+                    await navigator.clipboard.writeText(referralLinkFor(trader));
+                    toast.success("Referral link copied");
+                  } catch {
+                    toast.error("Could not copy link");
+                  }
+                }}
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+          <p className="fee-tiers-note refer-wallet-note">
+            Linked wallet <span className="sha">{trader ? shortAddr(trader) : "—"}</span>
+          </p>
+          <div className="refer-totals">
+            <div>
+              <span className="lbl">Referred taker vol</span>
+              <strong>
+                {fmtVolumeUsd((referrals?.referred_taker_volume ?? 0) / 1e6)}
+              </strong>
+            </div>
+            <div>
+              <span className="lbl">Referred maker vol</span>
+              <strong>
+                {fmtVolumeUsd((referrals?.referred_maker_volume ?? 0) / 1e6)}
+              </strong>
+            </div>
+            <div>
+              <Tooltip content="Taker fees generated by referred wallets">
+                <span className="lbl refer-fees-lbl">Referred Fees</span>
+              </Tooltip>
+              <strong>
+                {fmtVolumeUsd((referrals?.referred_taker_fees ?? 0) / 1e6)}
+              </strong>
+            </div>
+          </div>
+          <div className="refer-list-wrap">
+            <label>referred wallets</label>
+            {referralsLoading ? (
+              <p className="fee-tiers-note">Loading…</p>
+            ) : !referrals?.referrals?.length ? (
+              <p className="fee-tiers-note">No referrals yet.</p>
+            ) : (
+              <table className="refer-table">
+                <thead>
+                  <tr>
+                    <th>Wallet</th>
+                    <th>Taker</th>
+                    <th>Maker</th>
+                    <th>Fees</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {referrals.referrals.map((r) => (
+                    <tr key={r.trader}>
+                      <td className="sha" title={r.trader}>
+                        {shortAddr(r.trader)}
+                      </td>
+                      <td>{fmtVolumeUsd(r.taker_volume / 1e6)}</td>
+                      <td>{fmtVolumeUsd(r.maker_volume / 1e6)}</td>
+                      <td>{fmtVolumeUsd((r.taker_fees ?? 0) / 1e6)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      </dialog>
+      <dialog
+        ref={accountDialogRef}
+        className="account-dialog"
+        onClose={() => setOverlay(null)}
+        onPointerDown={onDialogBackdropPointerDown}
+        onClick={onDialogBackdropClick}
+      >
+        <div className="account-panel">
+          <header className="fee-tiers-head">
+            <h2>Account</h2>
+            <button
+              type="button"
+              className="fee-tiers-close"
+              aria-label="Close"
+              onClick={() => setOverlay(null)}
+            >
+              ×
+            </button>
+          </header>
+          <p className="fee-tiers-note">
+            Sign a short message with your wallet to save nickname or email. We email a 6-digit code; enter it here to verify.
+          </p>
+          <div className="field">
+            <label>nickname</label>
+            <input
+              value={nickDraft}
+              onChange={(e) => setNickDraft(e.target.value)}
+              placeholder="3–24 chars"
+              maxLength={24}
+              autoComplete="nickname"
+            />
+          </div>
+          <div className="account-actions">
+            <button type="button" className="primary" disabled={accountBusy || !walletOn} onClick={saveNickname}>
+              Save nickname
+            </button>
+          </div>
+          <div className="field">
+            <label>
+              email
+              {acct?.email_verified ? <span className="account-verified"> verified</span> : null}
+            </label>
+            <input
+              type="email"
+              value={emailDraft}
+              onChange={(e) => setEmailDraft(e.target.value)}
+              placeholder="you@example.com"
+              autoComplete="email"
+            />
+          </div>
+          <div className="account-actions">
+            <button type="button" className="primary" disabled={accountBusy || !walletOn} onClick={saveEmail}>
+              Save email
+            </button>
+          </div>
+          {(emailVerifyPending || (acct?.email && !acct.email_verified)) && (
+            <>
+              <div className="field">
+                <label>verification code</label>
+                <input
+                  value={emailCodeDraft}
+                  onChange={(e) => setEmailCodeDraft(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="6 digits"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                />
+              </div>
+              <div className="account-actions">
+                <button
+                  type="button"
+                  disabled={accountBusy || !walletOn || emailResendAfter > nowSec}
+                  onClick={resendEmailCode}
+                >
+                  {emailResendAfter > nowSec
+                    ? `Resend in ${emailResendAfter - nowSec}s`
+                    : "Resend code"}
+                </button>
+                <button type="button" className="primary" disabled={accountBusy || !walletOn} onClick={submitEmailCode}>
+                  Verify email
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </dialog>
+      <dialog
+        ref={feeTiersDialogRef}
+        className="fee-tiers-dialog"
+        onClose={() => setOverlay(null)}
+        onPointerDown={onDialogBackdropPointerDown}
+        onClick={onDialogBackdropClick}
+      >
+        <form method="dialog" className="fee-tiers-panel" onSubmit={() => setOverlay(null)}>
+          <header className="fee-tiers-head">
+            <h2>Fee tiers</h2>
+            <button type="submit" className="fee-tiers-close" aria-label="Close">
+              ×
+            </button>
+          </header>
+          <p className="fee-tiers-note">
+            Only <strong>takers</strong> pay a fee. Makers pay nothing. The fee uses a{" "}
+            <strong>coefficient</strong>, not a flat % of notional:
+          </p>
+          <pre className="fee-tiers-formula">fee = shares × coefficient × p × (1 − p)</pre>
+          <p className="fee-tiers-note">
+            <code>p</code> is the fill price in dollars (e.g. 0.40 at 40¢). The{" "}
+            <code>p × (1 − p)</code> curve peaks at 50¢ and is symmetric (30¢ = 70¢).
+          </p>
+          <div className="fee-tiers-volume">
+            <div className="fee-tiers-volume-row">
+              <span>
+                Your 30d weighted volume: <strong>{fmtVolumeUsd(volume30d)}</strong>
+                <span className="sha"> · tier {feeTier.tier} ({feeTier.label})</span>
+              </span>
+              <span className="sha">
+                {feeProgress.next
+                  ? `${fmtVolumeUsd(feeProgress.remaining)} to ${feeProgress.next.label}`
+                  : "top tier"}
+              </span>
+            </div>
+            <div
+              className="fee-tiers-progress"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(feeProgress.pct)}
+              aria-label={
+                feeProgress.next
+                  ? `Progress to ${feeProgress.next.label}`
+                  : "Top fee tier reached"
+              }
+            >
+              <div className="fee-tiers-progress-fill" style={{ width: `${feeProgress.pct}%` }} />
+            </div>
+            <p className="fee-tiers-note">
+              Weighted volume (wV) is snapshotted hourly (UTC :00, and on boot) into your
+              account — only <strong>taker</strong> fills over the last 30 days count.
+            </p>
+            <pre className="fee-tiers-formula">wV = shares × p × (1 − p)</pre>
+            <p className="fee-tiers-note">
+              <code>p</code> is the fill price in dollars. Maker fills, merges, splits, and
+              redeems do not earn wV. Makers do not pay any fees — only takers do.
+            </p>
+          </div>
+          <table className="fee-tiers-table">
+            <thead>
+              <tr>
+                <th className="left">Tier</th>
+                <th className="left">30d weighted vol</th>
+                <th>taker coeff</th>
+              </tr>
+            </thead>
+            <tbody>
+              {FEE_TIERS.map((t) => {
+                const active = t.tier === feeTier.tier;
+                return (
+                  <tr key={t.tier} className={active ? "me" : undefined}>
+                    <td className="left">{t.tier}</td>
+                    <td className="left">{t.label}</td>
+                    <td>{fmtTakerFeeCoeff(t.takerCoeff)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </form>
+      </dialog>
+      <header>
+        <a className="brand" href="https://arizal.xyz/" title="Arizal home">
+          <img className="brand-mark" src="/logo.svg" alt="" width={20} height={20} />
+          arizal<span>.xyz</span>
+        </a>
+        {connHealth === "reconnecting" && <span className="conn-down">connection failed, reconnecting</span>}
+        <div className="header-right">
+          <div className="header-balances">
+            <span className="bal">
+              <span className="lbl">Portfolio</span>{" "}
+              <strong>{acct ? Number(formatUnits(BigInt(acct.collateral), 6)).toFixed(2) : "—"}</strong>
+            </span>
+            <span className="bal">
+              <span className="lbl">Cash</span>{" "}
+              <strong>{acct ? Number(formatUnits(BigInt(acct.available), 6)).toFixed(2) : "—"}</strong>
+            </span>
+          </div>
+          <div className="header-funds">
+            <input
+              className="dw-amt"
+              value={dwAmt}
+              onChange={(e) => setDwAmt(e.target.value)}
+              aria-label="Deposit / withdraw amount"
+            />
+            <button type="button" onClick={faucet} disabled={!walletOn}>
+              Faucet
+            </button>
+            <button type="button" onClick={deposit} disabled={!walletOn}>
+              deposit
+            </button>
+            <button type="button" onClick={withdraw} disabled={!walletOn}>
+              withdraw
+            </button>
+          </div>
+          <div className="connect">
+            {isConnected && trader ? (
+              <>
+                {!onHardhat && (
+                  <button className="no" onClick={() => ensureHardhat().catch((e) => toast.error(String(e)))}>
+                    switch network
+                  </button>
+                )}
+                <div
+                  ref={walletMenuRef}
+                  className={`wallet-menu${walletMenuOpen ? " open" : ""}`}
+                  onMouseLeave={(e) => {
+                    const active = document.activeElement;
+                    if (active instanceof HTMLElement && e.currentTarget.contains(active)) active.blur();
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="wallet-menu-trigger"
+                    aria-haspopup="menu"
+                    aria-expanded={walletMenuOpen}
+                    onClick={() => setWalletMenuOpen((o) => !o)}
+                  >
+                    <WalletGlyph address={trader} />
+                    <span className={acct?.nickname ? "wallet-nick" : "sha"}>
+                      {acct?.nickname?.trim() || shortAddr(trader)}
+                    </span>
+                  </button>
+                  <div className="wallet-menu-drop" role="menu">
+                    <div className="wallet-menu-drop-inner">
+                      <div className="wallet-menu-addr">
+                        <span className="sha" title={trader}>
+                          {shortAddr(trader)}
+                        </span>
+                        <button
+                          type="button"
+                          className="wallet-menu-copy"
+                          aria-label="Copy address"
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            try {
+                              await navigator.clipboard.writeText(trader);
+                              toast.success("Address copied");
+                            } catch {
+                              toast.error("Could not copy address");
+                            }
+                          }}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setWalletMenuOpen(false);
+                          openAccountDialog();
+                        }}
+                      >
+                        Account
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setWalletMenuOpen(false);
+                          openReferDialog();
+                        }}
+                      >
+                        Refer & Earn
+                      </button>
+                      <a
+                        className="wallet-menu-link"
+                        role="menuitem"
+                        href="https://docs.arizal.xyz/"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => setWalletMenuOpen(false)}
+                      >
+                        Docs
+                      </a>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="wallet-menu-disconnect"
+                        onClick={() => {
+                          setWalletMenuOpen(false);
+                          disconnect();
+                        }}
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="connect-wallet"
+                onClick={() => appKit.open({ view: "Connect" })}
+              >
+                Connect wallet
+              </button>
+            )}
+          </div>
         </div>
       </header>
       <MarketPicker
@@ -2362,8 +3984,9 @@ export function App() {
         spotRaw={spotRaw}
         nowSec={nowSec}
         open={marketsOpen}
-        onToggle={() => setMarketsOpen((o) => !o)}
+        onToggle={() => setOverlay((o) => (o === "markets" ? null : "markets"))}
         rows={history}
+        quotes={quotesById}
         marketsTab={marketsTab}
         onMarketsTab={setMarketsTab}
         marketsTf={marketsTf}
@@ -2372,10 +3995,10 @@ export function App() {
         priceDp={priceDp}
         onOpen={(id, nextSide) => {
           openMarket(id, "push", nextSide);
-          setMarketsOpen(false);
+          setOverlay(null);
         }}
       />
-      <div className="grid">
+      <div className="grid" data-mobile-tab={mobileTab}>
         <div className="panel chart">
           <div className="chart-head">
             {market?.status === "Resolved" && <div className="resolved">RESOLVED</div>}
@@ -2443,9 +4066,7 @@ export function App() {
               </div>
             )}
             {market?.status !== "Resolved" && market?.expires_at ? (
-              <span className={`chart-countdown ${countdownTone(market.expires_at, nowSec)}`} title="Time to expiry">
-                {fmtCountdown(market.expires_at, nowSec)}
-              </span>
+              <LiveCountdown expiresAt={market.expires_at} className="chart-countdown" title="Time to expiry" />
             ) : null}
             <div className="tabs tf-tabs">
               {CHART_TF.map(([label]) => (
@@ -2461,58 +4082,8 @@ export function App() {
             endTs={chart?.end_ts || chart?.now_ts || nowSec}
             nowTs={chart?.now_ts ?? nowSec}
             color={invertSide ? "#e06a5c" : "#3dba7a"}
+            orderLines={chartOrderLines}
           />
-        </div>
-
-        <div className="panel wallet">
-          <h2>Account</h2>
-          <div>ETH {acct?.eth_wei ? formatEther(BigInt(acct.eth_wei)) : "—"}</div>
-          <div>wallet USDC {formatUnits(walletUsdc, 6)}</div>
-          <div>deposited {acct ? formatUnits(BigInt(acct.collateral), 6) : "—"}</div>
-          <div>reserved {acct ? formatUnits(BigInt(acct.reserved), 6) : "—"}</div>
-          <div>available {acct ? formatUnits(BigInt(acct.available), 6) : "—"}</div>
-          <div>
-            shares YES <span className="yes">{fmtShares(acct?.yes_shares)}</span> / NO{" "}
-            <span className="no">{fmtShares(acct?.no_shares)}</span>
-          </div>
-          <div className="row">
-            <input value={dwAmt} onChange={(e) => setDwAmt(e.target.value)} />
-            <button onClick={faucet} disabled={!walletOn}>
-              Faucet
-            </button>
-            <button onClick={deposit}>deposit</button>
-            <button onClick={withdraw}>withdraw</button>
-          </div>
-          {walletOn && (
-            <div className="session-auth">
-              {tradingEnabled ? (
-                <>
-                  <span className="ok">session wallet authorized</span>
-                  {" · "}
-                  <button type="button" className="link" onClick={() => void disableTrading()}>
-                    revoke
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  className="link"
-                  disabled={!cfg}
-                  onClick={() => void enableTrading()}
-                >
-                  Enable 1-click trading
-                </button>
-              )}
-            </div>
-          )}
-          {market?.status === "Resolved" &&
-            (positions.some((p) => p.marketId === mid && (p.redeemed || settledLocal.has(p.marketId))) ? (
-              <span className="sha">Redeemed</span>
-            ) : (
-              <button className="primary" onClick={() => redeem()}>
-                Redeem {market.winning_side?.toUpperCase()}
-              </button>
-            ))}
         </div>
 
         <div className="panel book">
@@ -2532,7 +4103,13 @@ export function App() {
             bids={depth.bids}
             mineAsks={mineLevels.asks}
             mineBids={mineLevels.bids}
-            onPick={setPrice}
+            onPick={(px, cumShares) => {
+              setPrice(px);
+              if (cumShares > 0) setSize(String(Number(cumShares.toFixed(6))));
+            }}
+            onCancelMine={(orderIds) => {
+              for (const id of orderIds) cancel(id, mid);
+            }}
           />
         </div>
 
@@ -2572,14 +4149,38 @@ export function App() {
               {entryKind === "limit" && (
                 <div className="field">
                   <label>{intent === "sell" ? "min ¢" : "price ¢"}</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={99}
-                    value={price}
-                    onChange={(e) => setPrice(+e.target.value)}
-                    onWheel={(e) => e.currentTarget.blur()}
-                  />
+                  <div className="price-stepper">
+                    <button
+                      type="button"
+                      className="price-step"
+                      aria-label="Decrease price 1¢"
+                      disabled={price <= 1}
+                      onClick={() => setPrice((p) => Math.max(1, Math.min(99, (Number(p) || 0) - 1)))}
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={1}
+                      max={99}
+                      value={price}
+                      onChange={(e) => {
+                        const n = +e.target.value;
+                        if (!Number.isFinite(n)) return;
+                        setPrice(Math.max(1, Math.min(99, Math.round(n))));
+                      }}
+                      onWheel={(e) => e.currentTarget.blur()}
+                    />
+                    <button
+                      type="button"
+                      className="price-step"
+                      aria-label="Increase price 1¢"
+                      disabled={price >= 99}
+                      onClick={() => setPrice((p) => Math.max(1, Math.min(99, (Number(p) || 0) + 1)))}
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
               )}
               <div className="field">
@@ -2602,20 +4203,30 @@ export function App() {
               </div>
               {entryKind === "limit" && (
                 <div className="field">
-                  <label>tif</label>
+                  <label>expires</label>
                   <select
-                    value={tif}
+                    value={expiryChoice}
                     onChange={(e) => {
-                      const v = e.target.value as Tif;
-                      setTif(v);
-                      const now = Math.floor(Date.now() / 1000);
-                      if (v === "GTD" && expiresAt < now + 60) setExpiresAt(now + 120);
+                      const v = e.target.value;
+                      if (v === "__custom__") {
+                        openCustomExpiryDialog();
+                        return;
+                      }
+                      setExpiryChoice(v as ExpiryChoice);
                     }}
                   >
-                    <option value="GTC">GTC</option>
-                    <option value="GTD">GTD</option>
-                    <option value="FOK">FOK</option>
-                    <option value="FAK">FAK</option>
+                    <option value="never">Never</option>
+                    <option value="5m">5m</option>
+                    <option value="1h">1h</option>
+                    <option value="12h">12h</option>
+                    <option value="24h">24h</option>
+                    {savedExpiry && (
+                      <option value="saved">{fmtCustomExpiryLabel(savedExpiry)}</option>
+                    )}
+                    {expiryChoice === "custom" && appliedCustomExpiry && (
+                      <option value="custom">{fmtCustomExpiryLabel(appliedCustomExpiry)}</option>
+                    )}
+                    <option value="__custom__">Custom…</option>
                   </select>
                 </div>
               )}
@@ -2636,88 +4247,136 @@ export function App() {
                 ))}
               </div>
             )}
-            {entryKind === "limit" && tif === "GTD" && (
-              <div className="row">
-                <div className="field">
-                  <label>expires unix</label>
-                  <input
-                    type="number"
-                    min={Math.floor(Date.now() / 1000) + 60}
-                    value={expiresAt || Math.floor(Date.now() / 1000) + 120}
-                    onChange={(e) => setExpiresAt(+e.target.value)}
-                    onWheel={(e) => e.currentTarget.blur()}
-                  />
-                </div>
-                <span className="sha">
-                  {expiresAt > 0 ? new Date(expiresAt * 1000).toLocaleString() : ""} · ≥ now+60s
-                </span>
-              </div>
+            {entryKind === "limit" && intent === "buy" && (
+              <label className="post-only-check">
+                <input
+                  type="checkbox"
+                  checked={postOnly}
+                  onChange={(e) => setPostOnly(e.target.checked)}
+                />
+                Post only
+              </label>
             )}
-            <button className={`go ${intent}`} disabled={!walletOn} onClick={place}>
-              {entryKind === "merge" || entryKind === "split"
-                ? entryKind
-                : `${intent === "sell" ? "SELL" : "BUY"} ${side.toUpperCase()}`}
+            <button
+              className={`go ${intent}`}
+              disabled={!walletOn || placePhase === "placing"}
+              onClick={place}
+            >
+              {placePhase === "placing"
+                ? "Placing…"
+                : entryKind === "merge" || entryKind === "split"
+                  ? entryKind
+                  : `${intent === "sell" ? "SELL" : "BUY"} ${side.toUpperCase()}`}
             </button>
             {(() => {
               const n = Number(size) || 0;
-              type Row = { label: string; value: string; valueClass?: string };
+              type Row = {
+                label: ReactNode;
+                key: string;
+                value: ReactNode;
+                valueClass?: string;
+                feeHelp?: boolean;
+              };
               const rows: Row[] = [];
+              const feePctRow = (): Row => ({
+                key: "fee coef",
+                label: "fee coef",
+                feeHelp: true,
+                value:
+                  walletTakerCoeff != null
+                    ? `${fmtTakerFeeCoeff(0)}/${fmtTakerFeeCoeff(walletTakerCoeff)}`
+                    : "—",
+              });
+              // Live GET /v1/config + WS `config` gas_fee (USDC raw). Post-only makers pay 0.
+              const takerGasFeeRow = (): Row => {
+                const postOnlyMaker = entryKind === "limit" && intent === "buy" && postOnly;
+                const label = (
+                  <Tooltip content="Transaction gas fee is paid by the taker. Use Post only to make sure order can't be a taker.">
+                    taker gas fee
+                  </Tooltip>
+                );
+                if (postOnlyMaker) return { key: "taker gas fee", label, value: "$0.00" };
+                const raw = cfg?.gas_fee;
+                if (raw == null || !Number.isFinite(Number(raw))) {
+                  return { key: "taker gas fee", label, value: "—" };
+                }
+                return {
+                  key: "taker gas fee",
+                  label,
+                  value: `$${(Number(raw) / 1e6).toFixed(2)}`,
+                };
+              };
               if (entryKind === "market") {
                 const levels = intent === "sell" ? depth.bids : depth.asks;
                 const vwap = approxVwapDecicents(levels, n);
                 const pxCents = vwap != null ? decicentsToCents(vwap) : null;
-                const feeUsdc =
-                  vwap == null ? null : estimateTakerFeeUsdc(n, vwap, cfg?.trading_fee_factor);
                 const notional = pxCents != null && n > 0 ? (n * pxCents) / 100 : null;
-                const feePct =
-                  feeUsdc != null && notional != null && notional > 0 ? (feeUsdc / notional) * 100 : null;
                 if (intent === "buy" && notional != null) {
                   const profit = n - notional;
                   const pct = notional > 0 ? (profit / notional) * 100 : 0;
-                  rows.push({ label: "cost", value: `${notional.toFixed(2)} USDC` });
+                  rows.push({ key: "cost", label: "cost", value: `$${notional.toFixed(2)}` });
                   rows.push({
-                    label: "profit",
-                    value: `${profit.toFixed(2)} USDC (${pct.toFixed(0)}%)`,
+                    key: "profit on win",
+                    label: "profit on win",
+                    value: `$${profit.toFixed(2)} (${pct.toFixed(0)}%)`,
                     valueClass: "payout",
                   });
                 } else if (intent === "sell") {
                   rows.push({
+                    key: "proceeds",
                     label: "proceeds",
                     value: notional != null ? `≈ ${notional.toFixed(2)} USDC` : "into bids",
                   });
                 }
                 rows.push({
+                  key: "exec",
                   label: "≈ exec",
                   value: vwap == null ? "—" : `${fmtPriceDecicents(Math.round(vwap))}¢`,
                 });
-                rows.push({ label: "fee %", value: feePct == null ? "—" : `${feePct.toFixed(2)}%` });
-                rows.push({
-                  label: "fee",
-                  value: feeUsdc == null ? "—" : `${fmtUsdNum(feeUsdc)} USDC`,
-                });
+                rows.push(feePctRow());
+                rows.push(takerGasFeeRow());
               } else if (entryKind === "split") {
-                rows.push({ label: "locks", value: `${n.toFixed(2)} USDC → YES + NO @ 50¢` });
-              } else if (entryKind === "merge") {
-                rows.push({ label: "returns", value: `≈ ${n.toFixed(2)} USDC` });
-              } else if (intent === "sell") {
-                rows.push({ label: "sell", value: `${n || 0} ${side.toUpperCase()} ≥ ${price}¢` });
-              } else {
-                const cost = (n * price) / 100;
-                const profit = n - cost;
-                const pct = cost > 0 ? (profit / cost) * 100 : 0;
-                rows.push({ label: "cost", value: `${cost.toFixed(2)} USDC` });
                 rows.push({
-                  label: "profit",
-                  value: `${profit.toFixed(2)} USDC (${pct.toFixed(0)}%)`,
-                  valueClass: "payout",
+                  key: "locks",
+                  label: "locks",
+                  value: `${n.toFixed(2)} USDC → YES + NO @ 50¢`,
                 });
+              } else if (entryKind === "merge") {
+                rows.push({ key: "returns", label: "returns", value: `≈ ${n.toFixed(2)} USDC` });
+              } else if (entryKind === "limit") {
+                const notional = n > 0 && price > 0 ? (n * price) / 100 : null;
+                if (intent === "sell") {
+                  rows.push({
+                    key: "sell",
+                    label: "sell",
+                    value: `${n || 0} ${side.toUpperCase()} ≥ ${price}¢`,
+                  });
+                } else {
+                  const cost = notional ?? 0;
+                  const profit = n - cost;
+                  const pct = cost > 0 ? (profit / cost) * 100 : 0;
+                  rows.push({ key: "cost", label: "cost", value: `$${cost.toFixed(2)}` });
+                  rows.push({
+                    key: "profit on win",
+                    label: "profit on win",
+                    value: `$${profit.toFixed(2)} (${pct.toFixed(0)}%)`,
+                    valueClass: "payout",
+                  });
+                }
+                rows.push(feePctRow());
+                rows.push(takerGasFeeRow());
               }
               if (rows.length === 0) return null;
               return (
                 <table className="place-summary">
                   <tbody>
                     {rows.map((r) => (
-                      <tr key={r.label}>
+                      <tr
+                        key={r.key}
+                        className={r.feeHelp ? "fee-help-row" : undefined}
+                        onClick={r.feeHelp ? () => setOverlay("fees") : undefined}
+                        title={r.feeHelp ? "Fee tiers & 30d volume" : undefined}
+                      >
                         <td className="lbl">{r.label}</td>
                         <td className={`val${r.valueClass ? ` ${r.valueClass}` : ""}`}>{r.value}</td>
                       </tr>
@@ -2726,8 +4385,36 @@ export function App() {
                 </table>
               );
             })()}
-            {err && <div className="err">{err}</div>}
-            {msg && <div className="ok">{msg}</div>}
+            {tradingSession !== "disconnected" && (
+              <div className="session-auth">
+                {tradingSession === "on" ? (
+                  <>
+                    <span className="ok">session wallet authorized</span>
+                    {" · "}
+                    <button type="button" className="link" onClick={() => void disableTrading()}>
+                      revoke
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="link"
+                    disabled={!cfg}
+                    onClick={() => void enableTrading()}
+                  >
+                    Enable 1-click trading
+                  </button>
+                )}
+              </div>
+            )}
+            {market?.status === "Resolved" &&
+              (settledLocal.has(mid) || positions.some((p) => p.marketId === mid && p.redeemed) ? (
+                <span className="sha">Redeemed</span>
+              ) : positions.some((p) => p.marketId === mid && Number(p.shares) > 0) ? (
+                <button className="primary" onClick={() => redeem()}>
+                  Redeem {market.winning_side?.toUpperCase()}
+                </button>
+              ) : null)}
           </div>
         </div>
 
@@ -2738,25 +4425,27 @@ export function App() {
             <thead>
               <tr>
                 <th className="al">op</th>
-                <th className="al">side</th>
-                <th>yes</th>
+                <th>px</th>
                 <th>size</th>
-                <th>time</th>
                 <th className="al">status</th>
                 <th className="left">tx</th>
+                <th>time</th>
               </tr>
             </thead>
             <tbody>
               {trades.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="left">
+                  <td colSpan={6} className="left">
                     no fills
                   </td>
                 </tr>
               )}
               {trades.map((t) => {
-                const selling = !!t.close_side;
-                const side = t.close_side || t.taker_side;
+                // Express every fill in the selected Yes/No frame (BUY NO @ p ↔ SELL YES @ 100−p).
+                const tradeSide = t.close_side || t.taker_side;
+                const nativeSell = !!t.close_side;
+                const selling = tradeSide === side ? nativeSell : !nativeSell;
+                const sidePx = side === "No" ? complementAsk(t.yes_price) : t.yes_price;
                 const booked = t.close_side
                   ? myFills.find(
                       (m) =>
@@ -2776,12 +4465,13 @@ export function App() {
                 return (
                   <tr key={`${t.market_id}-${t.ts_engine}-${t.fill_id}-${t.close_side ?? "buy"}`}>
                     <td className={selling ? "no al" : "yes al"}>{selling ? "SELL" : "BUY"}</td>
-                    <td className={side === "Yes" ? "yes al" : "no al"}>{side.toUpperCase()}</td>
-                    <td>{fmtPriceDecicents(t.yes_price)}¢</td>
+                    <td>{fmtPriceDecicents(sidePx)}¢</td>
                     <td>{fmtShares(t.size)}</td>
-                    <td>{fmtLocalTime(t.ts_engine)}</td>
-                    <td className={confirmed ? "al" : "sha al"}>{confirmed ? "confirmed" : "pending"}</td>
-                    <td className="left">{shortTx(hash)}</td>
+                    <td className="sha al">{confirmed ? "confirmed" : "pending"}</td>
+                    <td className="sha left">{shortTx(hash)}</td>
+                    <td className="sha" title={t.ts_engine ? new Date(t.ts_engine * 1000).toISOString() : undefined}>
+                      {fmtLocalTime(t.ts_engine)}
+                    </td>
                   </tr>
                 );
               })}
@@ -2793,16 +4483,13 @@ export function App() {
         <div className="panel mine">
           <div className="tabs">
             <button className={mineTab === "positions" ? "active" : ""} onClick={() => setMineTab("positions")}>
-              Open positions
-            </button>
-            <button className={mineTab === "closed" ? "active" : ""} onClick={() => setMineTab("closed")}>
-              Closed positions
+              Positions
             </button>
             <button className={mineTab === "orders" ? "active" : ""} onClick={() => setMineTab("orders")}>
               Orders
             </button>
-            <button className={mineTab === "trades" ? "active" : ""} onClick={() => setMineTab("trades")}>
-              Trades
+            <button className={mineTab === "history" ? "active" : ""} onClick={() => setMineTab("history")}>
+              History
             </button>
             <button className={mineTab === "funds" ? "active" : ""} onClick={() => setMineTab("funds")}>
               Funds
@@ -2816,7 +4503,7 @@ export function App() {
           <div className="panel-scroll">
           {!walletOn ? (
             <div className="sha">connect wallet</div>
-          ) : mineTab === "trades" ? (
+          ) : mineTab === "history" ? (
             <table>
               <thead>
                 <tr>
@@ -2827,6 +4514,7 @@ export function App() {
                   <th>size</th>
                   <th>pnl</th>
                   <th>fee</th>
+                  <th>value</th>
                   <th className="al">status</th>
                   <th className="left">tx</th>
                   <th>time</th>
@@ -2835,8 +4523,8 @@ export function App() {
               <tbody>
                 {myFills.length === 0 && (
                   <tr>
-                    <td colSpan={10} className="left">
-                      no trades
+                    <td colSpan={11} className="left">
+                      no history
                     </td>
                   </tr>
                 )}
@@ -2844,11 +4532,30 @@ export function App() {
                   const pending = t.status === "pending";
                   const pair = t.op === "merge" || t.op === "split";
                   const settle = t.op === "settle";
-                  const sell = !pair && !settle && !!t.closing;
+                  const sell = !pair && !settle && (!!t.closing || t.op === "close");
                   const op = (settle ? "redeem" : pair ? t.op || "" : sell ? "sell" : "buy").toUpperCase();
+                  const opCls = settle
+                    ? "op-redeem al"
+                    : t.op === "split"
+                      ? "op-split al"
+                      : t.op === "merge"
+                        ? "op-merge al"
+                        : sell
+                          ? "no al"
+                          : "yes al";
                   const unsettled = pending || t.status === "failed";
                   const pnl = unsettled ? null : settle || sell ? (t.pnl ?? 0) / 1e6 : 0;
                   const fee = pair || settle || unsettled || !t.isTaker ? null : (t.fee ?? 0) / 1e6;
+                  // Notional USDC: trades = shares × p; redeem/merge/split = $1 per share/pair.
+                  const value =
+                    unsettled || !(t.shares > 0)
+                      ? null
+                      : settle || pair
+                        ? t.shares
+                        : t.price > 0
+                          ? t.shares * (t.price / 1000)
+                          : null;
+                  const pxLabel = pair ? "—" : settle ? "$1" : `${fmtPriceDecicents(t.price)}¢`;
                   return (
                     <tr key={`${t.txHash}-${t.logIndex}-${t.side}-${t.op}-${t.id}`} onClick={() => openMarket(t.marketId)} style={{ cursor: "pointer" }}>
                       <td className="left">
@@ -2860,19 +4567,20 @@ export function App() {
                           priceDp={priceDpFor(cfg, marketAsset(markets.find((m) => m.id === t.marketId) || { id: t.marketId }))}
                         />
                       </td>
-                      <td className={pair || settle ? "al" : sell ? "no al" : "yes al"}>{op}</td>
+                      <td className={opCls}>{op}</td>
                       <td className={pair ? "al" : t.side === "Yes" ? "yes al" : "no al"}>{pair ? "—" : t.side.toUpperCase()}</td>
-                      <td>{pair ? "—" : `${t.price}¢`}</td>
+                      <td>{pxLabel}</td>
                       <td>{fmtShares(t.shares)}</td>
                       <td className={pnl == null ? "" : pnl < 0 ? "no" : pnl > 0 ? "yes" : ""}>
                         {pnl == null ? "—" : fmtSignedUsdNum(pnl)}
                       </td>
-                      <td>{fee == null ? "—" : fmtUsdNum(fee)}</td>
-                      <td className={pending ? "sha al" : t.status === "failed" ? "no al" : "al"}>
+                      <td className={fee == null ? "sha" : "no"}>{fee == null ? "—" : fmtUsdNum(fee)}</td>
+                      <td>{value == null ? "—" : fmtUsdNum(value)}</td>
+                      <td className="sha al">
                         {t.status === "pending" ? "pending" : t.status === "failed" ? "failed" : "confirmed"}
                       </td>
-                      <td className="left">{shortTx(t.txHash)}</td>
-                      <td>{fmtLocalTime(t.ts)}</td>
+                      <td className="sha left">{shortTx(t.txHash)}</td>
+                      <td>{fmtLocalDateTime(t.ts)}</td>
                     </tr>
                   );
                 })}
@@ -2922,6 +4630,7 @@ export function App() {
                   <th>px</th>
                   <th>left</th>
                   <th>tif</th>
+                  <th>expires</th>
                   <th>st</th>
                   <th></th>
                 </tr>
@@ -2929,12 +4638,14 @@ export function App() {
               <tbody>
                 {dbOrders.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="left">
+                    <td colSpan={9} className="left">
                       no open orders
                     </td>
                   </tr>
                 )}
-                {dbOrders.map((o) => (
+                {dbOrders.map((o) => {
+                  const expAt = o.expires_at && o.expires_at > 0 ? o.expires_at : 0;
+                  return (
                   <tr key={o.id} onClick={() => openMarket(o.market_id)} style={{ cursor: "pointer" }}>
                     <td className="left">
                       <MarketTitlePills
@@ -2947,11 +4658,14 @@ export function App() {
                     </td>
                     <td className="yes al">BUY</td>
                     <td className={o.side === "Yes" ? "yes" : "no"}>{o.side.toUpperCase()}</td>
-                    <td>{o.price}</td>
+                    <td>{fmtPriceDecicents(o.price)}¢</td>
                     <td>
                       {fmtShares(o.remaining, 1)}/{fmtShares(o.size, 1)}
                     </td>
                     <td>{o.tif || ""}</td>
+                    <td title={expAt ? new Date(expAt * 1000).toLocaleString() : "Never"}>
+                      {expAt ? fmtOrderExpiresLeft(expAt, nowSec) : "Never"}
+                    </td>
                     <td>{o.status}</td>
                     <td>
                       <button
@@ -2964,73 +4678,8 @@ export function App() {
                       </button>
                     </td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : mineTab === "closed" ? (
-            <table>
-              <thead>
-                <tr>
-                  <th className="left">market</th>
-                  <th className="al">op</th>
-                  <th className="al">side</th>
-                  <th>shares</th>
-                  <th>exit</th>
-                  <th>pnl</th>
-                  <th className="al">status</th>
-                  <th className="left">tx</th>
-                  <th>time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(() => {
-                  const rows = closedFills;
-                  if (rows.length === 0) {
-                    return (
-                      <tr>
-                        <td colSpan={9} className="left">
-                          no closed positions
-                        </td>
-                      </tr>
-                    );
-                  }
-                  return rows.map((t) => {
-                    const pending = t.status === "pending";
-                    const redeemOp = t.op === "settle";
-                    const op = redeemOp ? "REDEEM" : "CLOSE";
-                    const unsettled = pending || t.status === "failed";
-                    const pnl = unsettled ? null : (t.pnl ?? 0) / 1e6;
-                    return (
-                      <tr
-                        key={`closed-${t.txHash}-${t.logIndex}-${t.side}-${t.op}-${t.id}`}
-                        onClick={() => openMarket(t.marketId)}
-                        style={{ cursor: "pointer" }}
-                      >
-                        <td className="left">
-                          <MarketTitlePills
-                            market={markets.find((m) => m.id === t.marketId)}
-                            marketId={t.marketId}
-                            spotUsd={pxToUsd(spotRaw)}
-                            nowSec={nowSec}
-                            priceDp={priceDpFor(cfg, marketAsset(markets.find((m) => m.id === t.marketId) || { id: t.marketId }))}
-                          />
-                        </td>
-                        <td className="al">{op}</td>
-                        <td className={t.side === "Yes" ? "yes al" : "no al"}>{t.side.toUpperCase()}</td>
-                        <td>{fmtShares(t.shares)}</td>
-                        <td>{redeemOp ? "$1" : `${t.price}¢`}</td>
-                        <td className={pnl == null ? "" : pnl < 0 ? "no" : pnl > 0 ? "yes" : ""}>
-                          {pnl == null ? "—" : fmtSignedUsdNum(pnl)}
-                        </td>
-                        <td className={pending ? "sha al" : t.status === "failed" ? "no al" : "al"}>
-                          {t.status === "pending" ? "pending" : t.status === "failed" ? "failed" : "confirmed"}
-                        </td>
-                        <td className="left">{shortTx(t.txHash)}</td>
-                        <td>{fmtLocalTime(t.ts)}</td>
-                      </tr>
-                    );
-                  });
-                })()}
+                  );
+                })}
               </tbody>
             </table>
           ) : (
@@ -3041,6 +4690,7 @@ export function App() {
                   <th className="al">side</th>
                   <th>shares</th>
                   <th>entry</th>
+                  <th>mid</th>
                   <th>cost</th>
                   <th>value</th>
                   <th>pnl</th>
@@ -3050,14 +4700,18 @@ export function App() {
               </thead>
               <tbody>
                 {(() => {
+                  // Active markets + unredeemed winning resolved sides (losing resolved hidden).
                   const rows = positions.filter((p) => {
-                    return Number(p.shares) > 0;
+                    if (Number(p.shares) <= 0 || p.redeemed) return false;
+                    const mkt = markets.find((m) => m.id === p.marketId);
+                    if (!mkt || mkt.status !== "Resolved") return true;
+                    return !!mkt.winning_side && mkt.winning_side === p.side;
                   });
                   if (rows.length === 0) {
                     return (
                       <tr>
-                        <td colSpan={9} className="left">
-                          no open positions
+                        <td colSpan={10} className="left">
+                          no positions
                         </td>
                       </tr>
                     );
@@ -3095,6 +4749,7 @@ export function App() {
                         <td className={p.side === "Yes" ? "yes al" : "no al"}>{p.side.toUpperCase()}</td>
                         <td>{fmtShares(p.shares)}</td>
                         <td>{posEntry(p.usdc, p.shares)}</td>
+                        <td>{markMid == null ? "—" : `${markMid.toFixed(2)}¢`}</td>
                         <td>{fmtUsdc(p.usdc)}</td>
                         <td>{fmtUsdPlain(value)}</td>
                         <td className={pnl == null ? "" : pnl < 0 ? "no" : pnl > 0 ? "yes" : ""}>
@@ -3148,14 +4803,40 @@ export function App() {
           </div>
         </div>
       </div>
+      <nav className="mobile-tab-bar" aria-label="Mobile panels">
+        {(
+          [
+            ["trade", "Trade"],
+            ["chart", "Chart"],
+            ["book", "Book"],
+            ["account", "Account"],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            className={mobileTab === id ? "active" : undefined}
+            aria-current={mobileTab === id ? "page" : undefined}
+            onClick={() => setMobileTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
     </>
   );
 }
 
+type MineBookLevel = { size: number; orderIds: number[] };
+
 /** Resting size of the connected wallet, in the price shown on this book (asks are 100 − the other side). */
-function userBookLevels(orders: LedgerOrder[], market: string, view: Side): { bids: Map<number, number>; asks: Map<number, number> } {
-  const bids = new Map<number, number>();
-  const asks = new Map<number, number>();
+function userBookLevels(
+  orders: LedgerOrder[],
+  market: string,
+  view: Side
+): { bids: Map<number, MineBookLevel>; asks: Map<number, MineBookLevel> } {
+  const bids = new Map<number, MineBookLevel>();
+  const asks = new Map<number, MineBookLevel>();
   for (const o of orders) {
     if (o.market_id !== market) continue;
     if (!isOpenOrderStatus(o.status)) continue;
@@ -3164,7 +4845,10 @@ function userBookLevels(orders: LedgerOrder[], market: string, view: Side): { bi
     const bucket = o.side === view ? bids : asks;
     const px = Number(o.side === view ? o.price : 1000 - o.price);
     if (!Number.isFinite(px)) continue;
-    bucket.set(px, (bucket.get(px) || 0) + rem);
+    const cur = bucket.get(px) || { size: 0, orderIds: [] };
+    cur.size += rem;
+    cur.orderIds.push(o.id);
+    bucket.set(px, cur);
   }
   return { bids, asks };
 }
@@ -3176,22 +4860,30 @@ function BookLadder({
   mineAsks,
   mineBids,
   onPick,
+  onCancelMine,
 }: {
   asks: BookLevel[];
   bids: BookLevel[];
-  mineAsks?: Map<number, number>;
-  mineBids?: Map<number, number>;
-  onPick: (price: number) => void;
+  mineAsks?: Map<number, MineBookLevel>;
+  mineBids?: Map<number, MineBookLevel>;
+  /** Price in cents; cumShares = shares from best through the clicked level. */
+  onPick: (price: number, cumShares: number) => void;
+  /** Cancel resting orders at a mine price level. */
+  onCancelMine?: (orderIds: number[]) => void;
 }) {
   const askScrollRef = useRef<HTMLDivElement>(null);
 
-  // Best-first: cumulate USD from the spread outward so the far end of each side is 100%.
+  // Best-first: cumulate from the spread outward so the far end of each side is 100%.
   function withCum(levels: BookLevel[]) {
-    let cum = 0;
+    let cumUsd = 0;
+    let cumShares = 0;
     return levels.map(([p, sz]) => {
+      const shares = Number(sz);
+      const n = Number.isFinite(shares) && shares > 0 ? shares : 0;
       const level = levelUsd(p, sz);
-      cum += level;
-      return { p, sz, level, cum };
+      cumUsd += level;
+      cumShares += n;
+      return { p, sz, level, cum: cumUsd, cumShares };
     });
   }
   const askBestFirst = withCum(asks);
@@ -3216,24 +4908,38 @@ function BookLadder({
 
   function row(
     kind: "bid" | "ask",
-    r: { p: number; sz: number | string; level: number; cum: number },
+    r: { p: number; sz: number | string; level: number; cum: number; cumShares: number },
     sideTotal: number,
-    mine?: Map<number, number>
+    mine?: Map<number, MineBookLevel>
   ) {
-    const yours = mine?.get(Number(r.p)) || 0;
+    const yours = mine?.get(Number(r.p));
+    const yoursSize = yours?.size || 0;
     const depthPct = sideTotal > 0 ? Math.min(100, (r.cum / sideTotal) * 100) : 0;
     return (
       <tr
         key={`${kind}-${r.p}`}
-        className={yours > 0 ? `${kind} mine` : kind}
+        className={yoursSize > 0 ? `${kind} mine` : kind}
         style={{ ["--depth" as string]: `${depthPct}%` }}
-        title={yours > 0 ? `your order · ${fmtShares(yours, 1)}` : undefined}
+        title={yoursSize > 0 ? `your order · ${fmtShares(yoursSize, 1)}` : undefined}
         onClick={() => {
-          if (r.p) onPick(decicentsToCents(r.p));
+          if (r.p) onPick(decicentsToCents(r.p), r.cumShares);
         }}
       >
         <td className={kind === "bid" ? "yes" : "no"}>
-          {yours > 0 ? "● " : ""}
+          {yoursSize > 0 && yours ? (
+            <button
+              type="button"
+              className="book-mine-x"
+              title="Cancel order"
+              aria-label="Cancel order"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancelMine?.(yours.orderIds);
+              }}
+            >
+              ×
+            </button>
+          ) : null}
           {fmtPriceDecicents(r.p)}
         </td>
         <td>{fmtShares(r.sz, 1)}</td>
@@ -3244,9 +4950,9 @@ function BookLadder({
 
   function sideTable(
     kind: "bid" | "ask",
-    rows: { p: number; sz: number | string; level: number; cum: number }[],
+    rows: { p: number; sz: number | string; level: number; cum: number; cumShares: number }[],
     sideTotal: number,
-    mine?: Map<number, number>
+    mine?: Map<number, MineBookLevel>
   ) {
     return (
       <table>
@@ -3358,12 +5064,14 @@ const MidChart = memo(function MidChart({
   endTs,
   nowTs,
   color,
+  orderLines = [],
 }: {
   points: { t: number; p: number }[];
   startTs: number;
   endTs: number;
   nowTs: number;
   color: string;
+  orderLines?: { price: number; side: Side; rem: number }[];
 }) {
   const w = 320;
   const h = 120;
@@ -3379,17 +5087,21 @@ const MidChart = memo(function MidChart({
   const x = (ts: number) => pad + ((ts - start) / spanT) * (w - 2 * pad);
   let lo = 0;
   let hi = 100;
-  if (drawn.length > 0) {
-    let rawLo = drawn[0].p;
-    let rawHi = drawn[0].p;
+  if (drawn.length > 0 || orderLines.length > 0) {
+    let rawLo = drawn.length > 0 ? drawn[0].p : orderLines[0].price;
+    let rawHi = rawLo;
     for (const pt of drawn) {
       if (pt.p < rawLo) rawLo = pt.p;
       if (pt.p > rawHi) rawHi = pt.p;
     }
+    for (const o of orderLines) {
+      if (o.price < rawLo) rawLo = o.price;
+      if (o.price > rawHi) rawHi = o.price;
+    }
     lo = Math.floor(rawLo / 10) * 10;
     hi = Math.ceil(rawHi / 10) * 10;
-    if (hi <= lo) hi = lo + 10;
   }
+  if (hi <= lo) hi = lo + 10;
   const spanY = hi - lo;
   const y = (p: number) => pad + (1 - (p - lo) / spanY) * (h - 2 * pad);
   const d =
@@ -3406,6 +5118,7 @@ const MidChart = memo(function MidChart({
   const hoverLabel = hover
     ? `${fmtChartTick(tsFromX(hover.vx, start, spanT, w, pad), spanT)}  ${priceFromY(hover.vy, lo, spanY, h, pad).toFixed(1)}¢`
     : "";
+  const visibleOrders = orderLines.filter((o) => o.price >= lo && o.price <= hi);
   return (
     <div className="chart-body">
       <div className="chart-plot">
@@ -3416,7 +5129,7 @@ const MidChart = memo(function MidChart({
           onMouseLeave={() => setHover(null)}
         >
         <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
-          {drawn.length > 0 &&
+          {(drawn.length > 0 || visibleOrders.length > 0) &&
             priceSteps.map((p) => {
               const yy = y(p);
               return (
@@ -3434,6 +5147,27 @@ const MidChart = memo(function MidChart({
                 />
               );
             })}
+          {visibleOrders.map((o) => {
+            const yy = y(o.price);
+            const stroke = o.side === "Yes" ? "#3dba7a" : "#e06a5c";
+            return (
+              <line
+                key={`ord-${o.side}-${o.price}`}
+                className="chart-order-line"
+                x1={0}
+                x2={w}
+                y1={yy}
+                y2={yy}
+                stroke={stroke}
+                strokeWidth="1.25"
+                strokeDasharray="6 3"
+                vectorEffect="non-scaling-stroke"
+                opacity="0.85"
+              >
+                <title>{`${o.side} order · ${fmtCents(o.price)}¢ · ${fmtShares(o.rem, 1)}`}</title>
+              </line>
+            );
+          })}
           {yLast != null && (
             <line
               x1={0}
@@ -3463,12 +5197,28 @@ const MidChart = memo(function MidChart({
         {hover && <ChartCrosshair w={w} h={h} vx={hover.vx} vy={hover.vy} label={hoverLabel} />}
         </div>
         <div className="chart-yaxis">
-          {drawn.length > 0 &&
+          {(drawn.length > 0 || visibleOrders.length > 0) &&
             priceSteps.map((p) => (
               <div key={`y${p}`} className="tick" style={{ top: `${(y(p) / h) * 100}%` }}>
                 {fmtCents(p)}¢
               </div>
             ))}
+          {visibleOrders.map((o) => {
+            const stroke = o.side === "Yes" ? "#3dba7a" : "#e06a5c";
+            return (
+              <div
+                key={`oy-${o.side}-${o.price}`}
+                className={`tick order ${o.side === "Yes" ? "yes" : "no"}`}
+                style={{ top: `${(y(o.price) / h) * 100}%`, color: stroke }}
+                title={`${o.side} · ${fmtShares(o.rem, 1)}`}
+              >
+                <span className="lbl" style={{ color: stroke }}>
+                  ord
+                </span>
+                {fmtCents(o.price)}¢
+              </div>
+            );
+          })}
           {yLast != null && lastPx != null && (
             <div className="tick mid" style={{ top: `${(yLast / h) * 100}%`, color }}>
               <span className="lbl" style={{ color }}>mid</span>

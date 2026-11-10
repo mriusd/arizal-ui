@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="docs.css" />
+    <title>Contract | Docs | Arizal Exchange</title>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="https://arizal.xyz/">
+        <img src="logo.svg" alt="" width="20" height="20" />
+        arizal<span>.xyz</span>
+      </a>
+      <span class="header-title">Documentation</span>
+      <span aria-hidden="true"></span>
+    </header>
+    <div class="docs-shell">
+      <nav class="toc" aria-label="Docs sections">
+        <a href="/">Introduction</a>
+        <a href="/exchange">Exchange logic</a>
+        <a href="/contract" class="active">Contract</a>
+        <a href="/api">API</a>
+      </nav>
+      <main>
+<h1>Contract</h1>
+      <p>The address in <code>clearbook.toml</code> is a single non-upgradeable <code>Exchange</code> (no proxy). Constructor <code>(usdc, aggregator, operator)</code> sets the EIP-712 domain to <code>Arizal</code> / <code>1</code> and <code>tradeAdmin</code> / <code>oracle</code> to the operator. Balances and markets live on that address. Yes/No positions are ERC-1155 NFTs — one token id per market side (<code>tokenId(marketId, side)</code>). A contract change needs a new deploy (new address).</p>
+
+      <h3>Contracts</h3>
+      <table>
+        <thead><tr><th>Contract</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>Exchange</code></td><td>Custody, fills, fees, settlement, ERC-1155 share NFTs.</td></tr>
+          <tr><td><code>MockUSDC</code></td><td>6-decimal demo USDC. <code>faucet</code> mints to the caller.</td></tr>
+          <tr><td><code>MockAggregatorV3</code></td><td>Fake Chainlink BTC/USD. The node writes the Binance spot into the latest round.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Exchange calls</h3>
+      <table>
+        <thead><tr><th>Call</th><th>Who</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>deposit</code> / <code>withdraw</code></td><td>user</td><td>Move USDC in or out of that wallet’s balance.</td></tr>
+          <tr><td><code>split</code> / <code>merge</code></td><td>user</td><td>Mint or burn a complete Yes+No set (ERC-1155).</td></tr>
+          <tr><td><code>redeem</code></td><td>user</td><td>After resolution, $1 per winning share (losing dust is burned).</td></tr>
+          <tr><td><code>createMarket</code></td><td>trade admin</td><td>Optional standalone open (tests / tooling). Usual path is lazy create inside <code>settleFill</code> via <code>MarketSpec</code>.</td></tr>
+          <tr><td><code>settleFill</code></td><td>trade admin</td><td>Two EIP-712 orders (signer = trader or off-chain <code>ApproveAgent</code> / <code>AgentAuth</code>), optional <code>MarketSpec</code> if the market is missing, mint shares, charge taker <code>takerFee</code> + signed <code>gasFee</code> (both credit <code>tradeAdmin</code>).</td></tr>
+          <tr><td><code>settleClose</code></td><td>trade admin</td><td>Move share NFT from seller to buyer and pay the seller, minus the taker fee (credits <code>tradeAdmin</code>). No user signature.</td></tr>
+          <tr><td><code>settle</code></td><td>oracle</td><td>Hit early on barrier touch, or any kind after expiry from the aggregator. Write-once.</td></tr>
+          <tr><td><code>safeTransferFrom</code> / <code>setApprovalForAll</code></td><td>user</td><td>Transfer or approve position NFTs.</td></tr>
+          <tr><td><code>setTradeAdmin</code></td><td>operator</td><td>Only account that may create markets and settle fills/closes.</td></tr>
+          <tr><td><code>setOracle</code> / <code>disableOracleChanges</code></td><td>operator</td><td>Name the oracle; optionally freeze further oracle changes forever.</td></tr>
+          <tr><td><code>setURI</code></td><td>operator</td><td>ERC-1155 metadata URI template.</td></tr>
+        </tbody>
+      </table>
+      <p>Orders are EIP-712 type <code>Order(address trader,string marketId,string side,uint16 price,uint256 size,string orderType,string tif,uint256 nonce,uint256 salt,uint256 expiresAt,uint256 gasFee)</code>. Side is <code>"Yes"</code> / <code>"No"</code>; order type and TIF are human-readable strings so MetaMask shows a clear prompt. Session wallets use off-chain <code>ApproveAgent</code> (no on-chain <code>authorizeSession</code> / <code>approveAgent</code>). The domain name is <code>Arizal</code>, version <code>1</code>, and the verifying contract is the exchange.</p>
+      <nav class="docs-pager" aria-label="Page">
+        <a href="/exchange">&lt;&lt; Exchange logic</a>
+        <span class="sep">|</span>
+        <a href="/api">&gt;&gt; API</a>
+      </nav>
+      </main>
+    </div>
+  </body>
+</html>

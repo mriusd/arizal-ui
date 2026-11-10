@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="docs.css" />
+    <title>Exchange logic | Docs | Arizal Exchange</title>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="https://arizal.xyz/">
+        <img src="logo.svg" alt="" width="20" height="20" />
+        arizal<span>.xyz</span>
+      </a>
+      <span class="header-title">Documentation</span>
+      <span aria-hidden="true"></span>
+    </header>
+    <div class="docs-shell">
+      <nav class="toc" aria-label="Docs sections">
+        <a href="/">Introduction</a>
+        <a href="/exchange" class="active">Exchange logic</a>
+        <a href="/contract">Contract</a>
+        <a href="/api">API</a>
+      </nav>
+      <main>
+        <h1>Arizal</h1>
+        <p class="lead">The exchange at <a href="https://app.arizal.xyz/">app.arizal.xyz</a>. Hybrid CLOB for timed BTC hit, above, and between markets. Matching is off chain. USDC, Yes/No share NFTs, and settlement live on the exchange contract. The UI talks only to HTTP and websocket <code>/v1</code>. The on-chain EIP-712 domain name is <code>Arizal</code>.</p>
+
+        <h1>Exchange logic</h1>
+        <p>Three kinds: <strong>hit</strong>, <strong>above</strong>, <strong>between</strong>. Four timeframes: <strong>daily</strong>, <strong>weekly</strong>, <strong>monthly</strong>, <strong>quarterly</strong>. Each market has an America/New_York (ET) midnight <code>expires_at</code>. The node opens the next 7 expiries per kind × timeframe around Binance BTCUSDT. Strike grids come from <code>markets.env</code> (step size and rung count per asset × kind × timeframe; hit also has a reopen distance). Daily = next ET midnights; weekly = Mondays 00:00 ET; monthly = 1sts ET; quarterly = Jan/Apr/Jul/Oct 1 ET. Ids include timeframe, start time, and expiry so a resolved strike can reopen (e.g. <code>btc-hit-&lt;barrier&gt;-up-daily-&lt;start_ts&gt;-&lt;expires_at&gt;</code>).</p>
+        <ul>
+          <li><strong>Hit</strong> — Yes as soon as spot touches the barrier (up: spot ≥ barrier; down: spot ≤ barrier). At expiry without a touch, Yes if currently through, else No. After a Yes resolve, the same barrier+expiry waits until spot is far enough away (<code>REOPEN_STEP_PCT</code>% of the step, default 50%) before a new market opens.</li>
+          <li><strong>Above</strong> — settles only at expiry. Yes if spot ≥ barrier.</li>
+          <li><strong>Between</strong> — settles only at expiry. Yes if barrier ≤ spot ≤ barrier_high.</li>
+        </ul>
+        <p>One share pays $1 if that side wins and $0 if it loses. On settle the book locks and resting orders cancel.</p>
+
+        <h3>Book</h3>
+        <p>The book is two bid lists, Yes and No. A Yes bid at <code>p</code> crosses a No bid at <code>q</code> when <code>p + q &gt;= 100</code>. The trade prints at the maker’s price. The taker pays the complement, so the two sides together put up $1 per share. Prices are 1–99 cents. Same price is first-in, first-out. Size uses 6 decimals, the same scale as USDC (<code>1</code> share is <code>1000000</code>).</p>
+        <p>A buy can rest (GTC or GTD) or take immediately (FOK or FAK). A sell does not rest. It hits same-side bids. The seller is the taker. The resting bid is the maker and receives the shares.</p>
+        <p>Self-trades are rejected. Buys soft-reserve deposited USDC per market side. The engine does not hold keys or USDC. It writes an append-only tape. The trade admin later submits the match to the contract.</p>
+
+        <h3>Money on a fill</h3>
+        <p>Both wallets must have deposited balance. Yes pays <code>size × yesPrice / 100</code>. No pays the rest of the bundle, plus any price improvement. If the two limits sum to more than 100, the extra is returned to the taker. The taker also pays the trading fee. The maker pays no fee and receives no rebate. The node computes absolute <code>takerFee</code> and passes it into <code>settleFill</code> / <code>settleClose</code> (no maker rebate).</p>
+        <pre>fee = shares × (trading_fee_factor / 1e18) × p × (1 − p)</pre>
+        <p><code>p</code> is the execution price in dollars. The fee is the same at 30¢ and 70¢ and is largest at 50¢. Net fees and gas fees credit <code>tradeAdmin</code> balance (withdraw with ordinary <code>withdraw</code>). The local config uses <code>70000000000000000</code> (rate 0.07). A factor of 0 charges nothing.</p>
+
+        <h3>Split, merge, close, redeem</h3>
+        <p>Split locks <code>n</code> USDC and mints <code>n</code> Yes and <code>n</code> No ERC-1155 shares. Merge burns one Yes and one No and returns $1. Close sells shares into same-side bids; the trade admin calls <code>settleClose</code>, which moves the share NFT and the USDC. Redeem, after the market is resolved, burns the winning shares and credits $1 each. Losing shares pay nothing.</p>
+
+        <h3>Session wallet</h3>
+        <p>Enable 1-click trading has the main wallet <strong>sign</strong> (no tx) an EIP-712 <code>ApproveAgent</code> for a browser session key (24h; max 6 months). The signed auth is stored locally and sent with each place as <code>agent_auth</code>; <code>settleFill</code> verifies it on-chain. <code>order.trader</code> stays the main wallet. Withdraw, split, merge, redeem, and cancel still need the main wallet. Revoke deletes the browser key (no chain tx).</p>
+
+        <h3>Who can do what</h3>
+        <ul>
+          <li>Any wallet: deposit, withdraw, split, merge, redeem, transfer share NFTs.</li>
+          <li>Trade admin only: <code>createMarket</code>, <code>settleFill</code>, <code>settleClose</code>. A fresh deploy sets this to the operator. <code>settleClose</code> has no user signature, so that key can move shares and balance for closes.</li>
+          <li>Oracle only: <code>settle</code> (defaults to the operator).</li>
+          <li>Operator only: <code>setTradeAdmin</code>, <code>setOracle</code>, <code>disableOracleChanges</code>, <code>setURI</code>.</li>
+        </ul>
+        <nav class="docs-pager" aria-label="Page">
+          <a href="/">&lt;&lt; Introduction</a>
+          <span class="sep">|</span>
+          <a href="/contract">&gt;&gt; Contract</a>
+        </nav>
+      </main>
+    </div>
+  </body>
+</html>
